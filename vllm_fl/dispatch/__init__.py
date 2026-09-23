@@ -77,6 +77,8 @@ Configuration File (YAML):
 """
 
 import os
+import threading
+import weakref
 
 import torch
 
@@ -148,7 +150,23 @@ def resolve_op(op_name: str):
 # Fast-path opt-out: set VLLM_FL_OP_FAST_PATH=0 to disable per-op fn caching
 # in hot OOT layers and route every call back through OpManager.call.
 _OP_FAST_PATH_ENABLED = os.environ.get("VLLM_FL_OP_FAST_PATH", "1") == "1"
-_CACHED_OPS = []
+_CACHED_OPS: weakref.WeakSet["CachedOp"] = weakref.WeakSet()
+_CACHED_OPS_LOCK = threading.RLock()
+_logger = get_logger(__name__)
+
+_UNAVAILABLE_OP_ERROR = "No available implementation for op="
+
+
+def _requires_compile_prewarm() -> bool:
+    # Resolve only during tracing: importing dispatch also happens while the
+    # platform plugin is being selected. An eager platform import here would
+    # create a circular initialization dependency.
+    from vllm.platforms import current_platform
+
+    return (
+        getattr(current_platform, "vendor_name", None) == "ascend"
+        and current_platform.device_type == "npu"
+    )
 
 
 class CachedOp:
@@ -176,6 +194,9 @@ class CachedOp:
         "_manager_id",
         "_manager_epoch",
         "_policy_epoch",
+        "_prepared_for_compile",
+        "_first_use_pending",
+        "__weakref__",
     )
 
     def __init__(self, op_name: str) -> None:
@@ -186,22 +207,12 @@ class CachedOp:
         self._manager_id = -1
         self._manager_epoch = -1
         self._policy_epoch = -1
-        _CACHED_OPS.append(self)
+        self._prepared_for_compile = False
+        self._first_use_pending = False
+        with _CACHED_OPS_LOCK:
+            _CACHED_OPS.add(self)
 
-    def __call__(self, *args, **kwargs):
-        # Model construction prewarms and freezes CachedOps before Dynamo
-        # capture. During tracing, expose only the selected kernel call.
-        if self._frozen and torch.compiler.is_compiling():
-            return self._impl.fn(*args, **kwargs)
-
-        mgr = get_default_manager()
-
-        if not _OP_FAST_PATH_ENABLED:
-            return mgr.call(self._op_name, *args, **kwargs)
-
-        if is_dump_enabled():
-            return mgr.call(self._op_name, *args, **kwargs)
-
+    def _invalidate_if_stale(self, mgr) -> tuple[int, int, int]:
         manager_epoch = mgr.policy_epoch
         manager_id = id(mgr)
         policy_epoch = get_policy_epoch()
@@ -213,6 +224,90 @@ class CachedOp:
             self._impl = None
             self._frozen = False
             self._use_manager_call = False
+            self._prepared_for_compile = False
+            self._first_use_pending = False
+        return manager_id, manager_epoch, policy_epoch
+
+    def _resolve_and_cache(
+        self, mgr, manager_id: int, *, record_first_use: bool
+    ):
+        impl = mgr._resolve_impl(self._op_name)
+        if record_first_use:
+            mgr._record_first_use(self._op_name, impl)
+        self._impl = impl
+        # Resolution can initialize the manager and bump its epoch.
+        self._manager_id = manager_id
+        self._manager_epoch = mgr.policy_epoch
+        self._policy_epoch = get_policy_epoch()
+        self._first_use_pending = not record_first_use
+        return impl
+
+    def prepare_for_compile(self) -> bool:
+        """Resolve this call site before Dynamo tracing without executing it.
+
+        Unregistered or unavailable optional call sites stay lazy. Policy
+        selection, initialization, and configuration errors propagate so
+        compilation cannot silently capture an invalid dispatch state. Prewarm
+        does not emit first-use diagnostics, because no implementation has
+        executed; an eventual eager call does.
+        """
+        if not _OP_FAST_PATH_ENABLED:
+            raise RuntimeError(
+                "CachedOp compile prewarm requires VLLM_FL_OP_FAST_PATH=1"
+            )
+
+        mgr = get_default_manager()
+        manager_id, _, _ = self._invalidate_if_stale(mgr)
+        if self._use_manager_call:
+            return False
+
+        try:
+            if self._impl is None:
+                self._resolve_and_cache(
+                    mgr, manager_id, record_first_use=False
+                )
+        except RuntimeError as exc:
+            if not str(exc).startswith(_UNAVAILABLE_OP_ERROR):
+                raise
+            _logger.debug(
+                "Leaving optional CachedOp '%s' lazy during compile prewarm: %s",
+                self._op_name,
+                exc,
+            )
+            return False
+
+        self._prepared_for_compile = True
+        return True
+
+    def __call__(self, *args, **kwargs):
+        # Preserve main's frozen dispatch path for every platform that prewarms.
+        if self._frozen and torch.compiler.is_compiling():
+            return self._impl.fn(*args, **kwargs)
+
+        # Ascend fullgraph tracing uses the explicit runner prewarm lifecycle.
+        # Other vendors retain their existing cache/policy/fallback contract;
+        # their runners do not opt into mandatory compile prewarm.
+        if torch.compiler.is_compiling() and _requires_compile_prewarm():
+            if not _OP_FAST_PATH_ENABLED:
+                raise RuntimeError(
+                    "CachedOp was traced with VLLM_FL_OP_FAST_PATH disabled"
+                )
+            impl = self._impl if self._prepared_for_compile else None
+            if impl is None:
+                raise RuntimeError(
+                    f"CachedOp '{self._op_name}' was not prepared before compilation"
+                )
+            return impl.fn(*args, **kwargs)
+
+        mgr = get_default_manager()
+
+        if not _OP_FAST_PATH_ENABLED:
+            return mgr.call(self._op_name, *args, **kwargs)
+
+        if is_dump_enabled():
+            return mgr.call(self._op_name, *args, **kwargs)
+
+        manager_id, manager_epoch, policy_epoch = self._invalidate_if_stale(mgr)
 
         if self._use_manager_call:
             return mgr.call(self._op_name, *args, **kwargs)
@@ -224,19 +319,21 @@ class CachedOp:
             or self._manager_epoch != manager_epoch
             or self._policy_epoch != policy_epoch
         ):
-            impl = mgr._resolve_impl(self._op_name)
+            impl = self._resolve_and_cache(
+                mgr, manager_id, record_first_use=True
+            )
+
+        if self._first_use_pending:
             mgr._record_first_use(self._op_name, impl)
-            self._impl = impl
-            # resolve() can initialize the manager and bump its epoch.
-            self._manager_id = manager_id
-            self._manager_epoch = mgr.policy_epoch
-            self._policy_epoch = get_policy_epoch()
+            self._first_use_pending = False
 
         try:
             return impl.fn(*args, **kwargs)
         except Exception:
             self._impl = None
             self._frozen = False
+            self._prepared_for_compile = False
+            self._first_use_pending = False
             if get_policy().strict:
                 raise
             mgr._mark_failed_impl(self._op_name, impl.impl_id)
@@ -246,11 +343,17 @@ class CachedOp:
 
 def prewarm_cached_ops() -> int:
     """Resolve loaded CachedOps before torch.compile graph capture."""
+    with _CACHED_OPS_LOCK:
+        cached_ops = tuple(_CACHED_OPS)
+    if _requires_compile_prewarm():
+        # Ascend retains its fail-closed graph preparation contract.
+        return sum(cached.prepare_for_compile() for cached in cached_ops)
+
     mgr = get_default_manager()
     manager_id = id(mgr)
     policy_epoch = get_policy_epoch()
     resolved = 0
-    for cached in tuple(_CACHED_OPS):
+    for cached in cached_ops:
         try:
             impl = mgr._resolve_impl(cached._op_name)
             mgr._record_first_use(cached._op_name, impl)
