@@ -2,6 +2,7 @@
 
 import ast
 import logging
+import re
 import sys
 import threading
 import weakref
@@ -89,15 +90,28 @@ def test_non_ascend_compile_keeps_original_dispatch(subject, vendor, device, fas
 
 
 @pytest.mark.parametrize("warm_eager", [False, True])
-def test_ascend_still_rejects_missing_compile_prewarm(subject, warm_eager):
+def test_ascend_still_rejects_missing_compile_prewarm(subject, warm_eager, monkeypatch):
     module, _, platform = subject
     platform.vendor_name, platform.device_type = "ascend", "npu"
     cached = module.CachedOp("test")
     sample = torch.tensor([2.0])
     if warm_eager:
         assert torch.equal(cached(sample), sample + 1)
+    message = "CachedOp 'test' was not prepared before compilation"
+    # Assert the product guard directly: Dynamo versions may wrap its exception
+    # as Unsupported("Observed exception") without retaining the guard message.
+    with monkeypatch.context() as guard_patch:
+        guard_patch.setattr(torch.compiler, "is_compiling", lambda: True)
+        with pytest.raises(RuntimeError) as guard_error:
+            cached(sample)
+        assert type(guard_error.value) is RuntimeError
+        assert str(guard_error.value) == message
+
     compiled = torch.compile(lambda x: cached(x), fullgraph=True, backend="eager")
-    with pytest.raises(Exception, match="was not prepared before compilation"):
+    with pytest.raises(
+        (RuntimeError, torch._dynamo.exc.Unsupported),
+        match=rf"{re.escape(message)}|Observed exception",
+    ):
         compiled(sample)
 
 
@@ -117,16 +131,28 @@ def test_ascend_prepared_trace_never_enters_manager(subject):
     assert torch.equal(compiled(sample), sample + 1)
 
 
-def test_ascend_still_rejects_disabled_fast_path(subject):
+def test_ascend_still_rejects_disabled_fast_path(subject, monkeypatch):
     module, _, platform = subject
     platform.vendor_name, platform.device_type = "ascend", "npu"
     module._OP_FAST_PATH_ENABLED = False
     cached = module.CachedOp("test")
     with pytest.raises(RuntimeError, match="requires VLLM_FL_OP_FAST_PATH=1"):
         module.prewarm_cached_ops()
+    sample = torch.tensor([2.0])
+    message = "CachedOp was traced with VLLM_FL_OP_FAST_PATH disabled"
+    with monkeypatch.context() as guard_patch:
+        guard_patch.setattr(torch.compiler, "is_compiling", lambda: True)
+        with pytest.raises(RuntimeError) as guard_error:
+            cached(sample)
+        assert type(guard_error.value) is RuntimeError
+        assert str(guard_error.value) == message
+
     compiled = torch.compile(lambda x: cached(x), fullgraph=True, backend="eager")
-    with pytest.raises(Exception, match="FAST_PATH disabled"):
-        compiled(torch.tensor([2.0]))
+    with pytest.raises(
+        (RuntimeError, torch._dynamo.exc.Unsupported),
+        match=rf"{re.escape(message)}|Observed exception",
+    ):
+        compiled(sample)
 
 
 def test_eager_does_not_resolve_platform(subject, monkeypatch):
