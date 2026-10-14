@@ -80,9 +80,11 @@ class AscendGraphParams:
     """Host-side task update state for a captured Ascend full graph."""
 
     events: dict[int, list[Any]]
-    workspaces: dict[int, torch.Tensor | None]
+    # One workspace per captured task: PA/FIA and different layer geometries
+    # must not reuse the first layer's allocation merely because T matches.
+    workspaces: dict[int, list[torch.Tensor]]
     handles: dict[int, list[Any]]
-    attention_params: dict[int, list[tuple[Any, ...]]]
+    attention_params: dict[int, list[Any]]
 
 
 _ascend_graph_params: AscendGraphParams | None = None
@@ -95,7 +97,7 @@ def set_ascend_graph_params(capture_sizes: list[int]) -> None:
     sizes = sorted(set(capture_sizes))
     _ascend_graph_params = AscendGraphParams(
         events={size: [] for size in sizes},
-        workspaces={size: None for size in sizes},
+        workspaces={size: [] for size in sizes},
         handles={size: [] for size in sizes},
         attention_params={size: [] for size in sizes},
     )
@@ -109,11 +111,10 @@ def weak_ref_ascend_graph_workspaces() -> None:
     """Release strong references after NPUGraph owns its workspaces."""
     if _ascend_graph_params is None:
         return
-    for num_tokens, workspace in _ascend_graph_params.workspaces.items():
-        if workspace is not None:
-            _ascend_graph_params.workspaces[num_tokens] = weak_ref_tensors(
-                workspace
-            )
+    for num_tokens, workspaces in _ascend_graph_params.workspaces.items():
+        _ascend_graph_params.workspaces[num_tokens] = [
+            weak_ref_tensors(workspace) for workspace in workspaces
+        ]
 
 
 def set_ascend_graph_capturing(capturing: bool) -> None:
