@@ -6,6 +6,8 @@ Tests for compilation graph module.
 
 from unittest.mock import MagicMock
 
+import torch
+
 
 class TestGraphOptions:
     """Test GraphOptions dataclass."""
@@ -49,7 +51,10 @@ class TestGraphEntry:
         assert entry.input_addresses is None
 
 
-def test_ascend_graph_params_are_initialized_per_capture_size():
+def test_ascend_graph_params_are_initialized_per_capture_size(monkeypatch):
+    import vllm_fl.compilation.graph as graph
+
+    monkeypatch.setattr(graph, "_ascend_graph_params", None)
     from vllm_fl.compilation.graph import (
         get_ascend_graph_params,
         set_ascend_graph_params,
@@ -63,3 +68,25 @@ def test_ascend_graph_params_are_initialized_per_capture_size():
     assert set(params.workspaces) == {1, 4}
     assert set(params.handles) == {1, 4}
     assert set(params.attention_params) == {1, 4}
+
+
+def test_weak_workspace_lifecycle_retains_each_task(monkeypatch):
+    import vllm_fl.compilation.graph as graph
+
+    monkeypatch.setattr(graph, "_ascend_graph_params", None)
+    graph.set_ascend_graph_params([2])
+    owned = [torch.empty(7), torch.empty(9), torch.empty(11)]
+    graph.get_ascend_graph_params().workspaces[2] = owned
+    weakened = []
+
+    def weak_ref(value):
+        weakened.append(value)
+        return ("weak", id(value))
+
+    monkeypatch.setattr(graph, "weak_ref_tensors", weak_ref)
+    graph.weak_ref_ascend_graph_workspaces()
+    assert len(weakened) == 3
+    assert all(actual is expected for actual, expected in zip(weakened, owned))
+    assert graph.get_ascend_graph_params().workspaces[2] == [
+        ("weak", id(value)) for value in owned
+    ]

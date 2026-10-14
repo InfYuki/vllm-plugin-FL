@@ -1,37 +1,45 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
-"""CPU contract tests of production task methods, without NPU/vLLM imports."""
+"""CPU contract tests using the real Ascend module with isolated NPU mocks."""
 
-import __future__
-
-import ast
+import importlib
+import sys
 from contextlib import nullcontext
-from dataclasses import dataclass, field
-from enum import Enum
-from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, ClassVar, Optional
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 
-def _load_definitions(path, names, namespace):
-    tree = ast.parse(path.read_text())
-    tree.body = [
-        node
-        for node in tree.body
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names
-    ]
-    exec(
-        compile(tree, str(path), "exec", flags=__future__.annotations.compiler_flag),
-        namespace,
-    )
-
-
 @pytest.fixture
-def runtime():
-    root = Path(__file__).resolve().parents[3]
+def runtime(monkeypatch):
+    # Load real vLLM dependencies before replacing only the hardware module.
+    import vllm.model_executor.models.config as model_config
+    import vllm.v1.attention.backends.registry as registry
+
+    import vllm_fl.compilation.graph  # noqa: F401
+
+    prefix = "vllm_fl.dispatch.backends.vendor.ascend"
+    before = {
+        name: mod
+        for name, mod in sys.modules.items()
+        if name == prefix or name.startswith(prefix + ".")
+    }
+    parent = importlib.import_module("vllm_fl.dispatch.backends.vendor")
+    missing = object()
+    old_parent = getattr(parent, "ascend", missing)
+    cls = model_config.HybridAttentionMambaModelConfig
+    # Preserve the descriptor, not a bound method.
+    old_verify = cls.__dict__["verify_and_update_config"]
+    for name in before:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(registry, "register_backend", Mock())
+    for owner, name in (
+        (torch, "Event"),
+        (torch.cuda, "Event"),
+        (torch.cuda, "Stream"),
+    ):
+        monkeypatch.setattr(owner, name, getattr(owner, name))
     state = SimpleNamespace(
         events={2: []},
         handles={2: []},
@@ -41,6 +49,7 @@ def runtime():
     calls = []
     stream = object()
     npu = SimpleNamespace(
+        is_available=lambda: False,
         current_stream=lambda: stream,
         stream=lambda value: nullcontext(),
         ExternalEvent=lambda: Mock(),
@@ -49,13 +58,6 @@ def runtime():
         graph_task_update_begin=Mock(),
         graph_task_update_end=Mock(),
     )
-
-    class TorchProxy:
-        def __getattr__(self, name):
-            return getattr(torch, name)
-
-    torch_proxy = TorchProxy()
-    torch_proxy.npu = npu
 
     class FIA:
         def __call__(self, **kwargs):
@@ -75,44 +77,30 @@ def runtime():
         ),
         _npu_paged_attention=lambda **kw: calls.append(("pa", kw)),
     )
-    ns = dict(
-        torch=torch_proxy,
-        torch_npu=ops,
-        dataclass=dataclass,
-        field=field,
-        Enum=Enum,
-        Any=Any,
-        ClassVar=ClassVar,
-        List=list,
-        Optional=Optional,
-        Tuple=tuple,
-        Type=type,
-        AttentionImpl=object,
-        AttentionLayer=object,
-        nn=SimpleNamespace(Module=object),
-        VllmConfig=object,
-        CommonAttentionMetadata=object,
-        AttentionCGSupport=SimpleNamespace(ALWAYS=1),
-        AttentionMaskBuilder=object,
-        _SWA_INT_MAX=2147483647,
-        get_ascend_graph_params=lambda: state,
-        is_ascend_graph_capturing=lambda: ns["capturing"],
-        weak_ref_tensors=lambda tensor: tensor,
-        capturing=True,
-    )
-    _load_definitions(
-        root / "vllm_fl/dispatch/backends/vendor/ascend/impl/attention.py",
-        {
-            "AscendAttentionState",
-            "AscendMetadata",
-            "AscendAttentionMetadataBuilder",
-            "AscendAttentionBackendImpl",
-            "PagedAttentionGraphParam",
-            "FusedInferAttentionGraphParam",
-        },
-        ns,
-    )
-    return SimpleNamespace(ns=ns, state=state, calls=calls, npu=npu, ops=ops)
+    hardware = ModuleType("torch_npu")
+    hardware.__dict__.update(vars(ops))
+    monkeypatch.setitem(sys.modules, "torch_npu", hardware)
+    monkeypatch.setattr(torch, "npu", npu, raising=False)
+    try:
+        module = importlib.import_module(prefix + ".impl.attention")
+        ns = vars(module)
+        ns["capturing"] = True
+        monkeypatch.setattr(module, "get_ascend_graph_params", lambda: state)
+        monkeypatch.setattr(
+            module, "is_ascend_graph_capturing", lambda: ns["capturing"]
+        )
+        monkeypatch.setattr(module, "weak_ref_tensors", lambda tensor: tensor)
+        yield SimpleNamespace(ns=ns, state=state, calls=calls, npu=npu, ops=ops)
+    finally:
+        cls.verify_and_update_config = old_verify
+        for name in list(sys.modules):
+            if name == prefix or name.startswith(prefix + "."):
+                del sys.modules[name]
+        sys.modules.update(before)
+        if old_parent is missing:
+            vars(parent).pop("ascend", None)
+        else:
+            parent.ascend = old_parent
 
 
 def _metadata(rt, length=6):
@@ -219,12 +207,6 @@ def test_decode_builder_mask_for_sliding_window_only(runtime):
 
 
 def test_builder_reads_window_from_cache_spec(runtime):
-    runtime.ns["cdiv"] = lambda numerator, denominator: (
-        (numerator + denominator - 1) // denominator
-    )
-    runtime.ns["AscendAttentionBackend"] = SimpleNamespace(
-        get_supported_block_size=lambda: [128]
-    )
     config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=4096),
         speculative_config=None,
@@ -234,28 +216,6 @@ def test_builder_reads_window_from_cache_spec(runtime):
         SimpleNamespace(sliding_window=64), ["fia"], config, torch.device("cpu")
     )
     assert builder.sliding_window == 64
-
-
-def test_weak_workspace_lifecycle_retains_each_task(runtime):
-    root = Path(__file__).resolve().parents[3]
-    owned = [torch.empty(7), torch.empty(9), torch.empty(11)]
-    runtime.state.workspaces[2] = owned
-    weakened = []
-
-    def weak_ref(value):
-        weakened.append(value)
-        return ("weak", id(value))
-
-    namespace = dict(_ascend_graph_params=runtime.state, weak_ref_tensors=weak_ref)
-    _load_definitions(
-        root / "vllm_fl/compilation/graph.py",
-        {"weak_ref_ascend_graph_workspaces"},
-        namespace,
-    )
-    namespace["weak_ref_ascend_graph_workspaces"]()
-    assert len(weakened) == 3
-    assert all(actual is expected for actual, expected in zip(weakened, owned))
-    assert runtime.state.workspaces[2] == [("weak", id(value)) for value in owned]
 
 
 def test_missing_live_layer_fails_instead_of_replaying_stale_lengths(runtime):
