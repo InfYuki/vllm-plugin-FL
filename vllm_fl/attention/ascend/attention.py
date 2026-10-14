@@ -707,13 +707,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         raise RuntimeError(
                             f"Missing FIA workspace for graph size {num_tokens}"
                         )
+                    # Match rc1's model-level SWA guard, including global
+                    # attention layers in a model with sliding_window metadata.
+                    # Rebinding their captured table can corrupt FULL replay.
+                    block_table = param.block_table
+                    if not hasattr(
+                        vllm_config.model_config.hf_text_config, "sliding_window"
+                    ):
+                        block_table = live.block_tables
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     torch_npu.npu_fused_infer_attention_score.out(
                         query=param.query,
                         key=param.key,
                         value=param.value,
                         atten_mask=param.attn_mask,
-                        block_table=live.block_tables,
+                        block_table=block_table,
                         input_layout="TND",
                         block_size=param.block_size,
                         actual_seq_lengths=live.actual_seq_lengths_q,
@@ -817,14 +825,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
             key = key[:num_tokens]
             value = value[:num_tokens]
 
-        # Determine sparse_mode based on mask availability
-        # sparse_mode=3 requires attn_mask; sparse_mode=0 does not
-        # sparse_mode = 3 if attn_metadata.attn_mask is not None else 0
+        mask_args = {}
+        sparse_mode = 0
+        if attn_metadata.causal:
+            sparse_mode = 4 if self.sliding_window is not None else 3
+            mask_args["atten_mask"] = attn_metadata.attn_mask
+            if self.sliding_window is not None:
+                mask_args.update(pre_tokens=self.sliding_window, next_tokens=0)
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query=query,
             key=key,
             value=value,
-            atten_mask=attn_metadata.attn_mask,
             block_table=block_table,
             input_layout="TND",
             block_size=block_size,
@@ -833,7 +844,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             num_key_value_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             scale=self.scale,
-            sparse_mode=3,
+            sparse_mode=sparse_mode,
+            **mask_args,
         )
 
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
@@ -855,10 +867,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 "Ascend FULL graph task capture does not yet support "
                 "quantized attention in FL"
             )
-        if self.sliding_window is not None or self.sinks is not None:
+        if self.sinks is not None:
             raise NotImplementedError(
                 "Ascend FULL graph task capture currently supports regular "
-                "attention without sliding windows or sinks"
+                "attention without sinks"
             )
         if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
             raise NotImplementedError(
@@ -892,9 +904,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         graph_params = get_graph_params()
         graph_params.require_shape(num_tokens)
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
-        sparse_mode = 3
-        pre_tokens = _SWA_INT_MAX
-        next_tokens = _SWA_INT_MAX
+        sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
+        pre_tokens = self.sliding_window or _SWA_INT_MAX
+        next_tokens = 0 if self.sliding_window else _SWA_INT_MAX
         workspace = graph_params.workspaces[num_tokens]
         if workspace is None:
             workspace = (

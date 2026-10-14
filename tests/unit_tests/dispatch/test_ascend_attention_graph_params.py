@@ -19,6 +19,7 @@ def _config(*, pa_shape_list=None, speculative=False, quant=False):
     return SimpleNamespace(
         speculative_config=object() if speculative else None,
         quant_config=object() if quant else None,
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace()),
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
         ),
@@ -131,11 +132,16 @@ def _metadata(seq_len=6):
         seq_lens_list=[seq_len],
         actual_seq_lengths_q=[1],
         attn_mask=None,
+        causal=True,
     )
 
 
+@pytest.mark.parametrize(
+    "model_window,layer_window",
+    [("absent", None), (None, None), (16, None), (16, 16)],
+)
 def test_fia_capture_and_replay_rebind_live_lengths_and_tables(
-    monkeypatch, graph_task_runtime
+    monkeypatch, graph_task_runtime, model_window, layer_window
 ) -> None:
     calls, capture_stream = graph_task_runtime
     op_calls = []
@@ -158,7 +164,10 @@ def test_fia_capture_and_replay_rebind_live_lengths_and_tables(
     )
     prepare_graph_params(1)
     config = _config()
+    if model_window != "absent":
+        config.model_config.hf_text_config.sliding_window = model_window
     impl = _impl(config)
+    impl.sliding_window = layer_window
     query = torch.empty(1, 4, 8)
     output = torch.empty_like(query)
     captured = _metadata(6)
@@ -172,9 +181,24 @@ def test_fia_capture_and_replay_rebind_live_lengths_and_tables(
     assert isinstance(params.attn_params[1][0], attention.FusedInferAttentionGraphParam)
     assert params.workspaces[1] is workspace
     assert params.handles[1] == ["handle"]
+    expected_sparse = 4 if layer_window else 3
+    expected_pre = layer_window or attention._SWA_INT_MAX
+    expected_next = 0 if layer_window else attention._SWA_INT_MAX
+    for _, kwargs in op_calls:
+        assert kwargs["sparse_mode"] == expected_sparse
+        assert kwargs["pre_tokens"] == expected_pre
+        assert kwargs["next_tokens"] == expected_next
+    param = params.attn_params[1][0]
+    assert param.block_table is captured.block_tables
+    assert (param.sparse_mode, param.pre_tokens, param.next_tokens) == (
+        expected_sparse, expected_pre, expected_next
+    )
 
     live = _metadata(9)
     live.block_tables = torch.tensor([[3]], dtype=torch.int32)
+    # The retained table is a static buffer; subsequent input preparation
+    # updates its contents in place rather than replacing its address.
+    captured.block_tables.fill_(5)
     update_stream = object()
     attention.AscendAttentionBackendImpl.update_graph_params(
         update_stream,
@@ -183,9 +207,18 @@ def test_fia_capture_and_replay_rebind_live_lengths_and_tables(
         config,
     )
     replay_kwargs = op_calls[-1][1]
-    assert replay_kwargs["actual_seq_lengths"] == [1]
-    assert replay_kwargs["actual_seq_lengths_kv"] == [9]
-    assert replay_kwargs["block_table"] is live.block_tables
+    assert replay_kwargs["actual_seq_lengths"] is live.actual_seq_lengths_q
+    assert replay_kwargs["actual_seq_lengths_kv"] is live.seq_lens_list
+    expected_table = (
+        live.block_tables if model_window == "absent" else captured.block_tables
+    )
+    assert replay_kwargs["block_table"] is expected_table
+    assert replay_kwargs["block_table"].item() == (
+        3 if model_window == "absent" else 5
+    )
+    assert replay_kwargs["sparse_mode"] == expected_sparse
+    assert replay_kwargs["pre_tokens"] == expected_pre
+    assert replay_kwargs["next_tokens"] == expected_next
     assert ("capture-begin", capture_stream) in calls
     assert ("update-begin", update_stream, "handle") in calls
     assert ("event-record", update_stream) in calls
@@ -339,3 +372,134 @@ def test_regular_graph_capture_rejects_unsupported_only_on_capture_path() -> Non
         attention.AscendAttentionBackendImpl._require_regular_graph_capture(
             impl, metadata, SimpleNamespace(layer_name="layer")
         )
+
+
+@pytest.mark.parametrize("exclusion", ["speculative", "quant", "sinks"])
+def test_swa_capture_retains_unsupported_feature_guards(exclusion) -> None:
+    impl = _impl(_config(
+        speculative=exclusion == "speculative", quant=exclusion == "quant"
+    ))
+    impl.sliding_window = 16
+    impl.sinks = object() if exclusion == "sinks" else None
+    with pytest.raises(NotImplementedError):
+        attention.AscendAttentionBackendImpl._require_regular_graph_capture(
+            impl, _metadata(), SimpleNamespace(layer_name="layer")
+        )
+
+
+def test_regular_graph_capture_accepts_swa_decode() -> None:
+    impl = _impl(_config())
+    impl.sliding_window = 16
+    assert attention.AscendAttentionBackendImpl._require_regular_graph_capture(
+        impl, _metadata(), SimpleNamespace(layer_name="layer")
+    ) == "layer"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [attention.AscendAttentionState.PrefillNoCache,
+     attention.AscendAttentionState.PrefillCacheHit,
+     attention.AscendAttentionState.DecodeOnly,
+     attention.AscendAttentionState.ChunkedPrefill],
+)
+@pytest.mark.parametrize("window", [None, 16])
+@pytest.mark.parametrize("causal", [True, False])
+def test_fia_eager_preserves_swa_parameters_and_cache_paths(
+    monkeypatch, state, window, causal
+) -> None:
+    monkeypatch.setattr(attention, "get_forward_context", lambda: SimpleNamespace())
+    op_calls = []
+    query = torch.empty(2, 4, 8)
+    key = torch.empty(2, 2, 8)
+    value = torch.empty_like(key)
+    output = torch.full_like(query, -1)
+    expected = torch.full((1, 4, 8), 7.0)
+    monkeypatch.setattr(
+        attention.torch_npu, "npu_fused_infer_attention_score",
+        lambda **kwargs: (op_calls.append(kwargs) or expected, None),
+    )
+    impl = _impl(_config())
+    impl.sliding_window = window
+    metadata = _metadata()
+    metadata.attn_state = state
+    metadata.causal = causal
+    metadata.attn_mask = torch.ones(2, 2, dtype=torch.bool)
+    result = attention.AscendAttentionBackendImpl.forward_fused_infer_attention(
+        impl, query, key, value, metadata, output
+    )
+    kwargs = op_calls[0]
+    assert result is output
+    assert torch.equal(output[:1], expected)
+    assert torch.all(output[1:] == -1)
+    if causal:
+        assert kwargs["atten_mask"] is metadata.attn_mask
+    else:
+        assert "atten_mask" not in kwargs
+    assert kwargs["sparse_mode"] == (
+        (4 if window is not None else 3) if causal else 0
+    )
+    if window is not None and causal:
+        assert kwargs["pre_tokens"] == window
+        assert kwargs["next_tokens"] == 0
+    else:
+        assert "pre_tokens" not in kwargs and "next_tokens" not in kwargs
+    if state == attention.AscendAttentionState.PrefillNoCache:
+        assert kwargs["block_table"] is None
+        assert kwargs["key"].shape[0] == 1
+        assert kwargs["actual_seq_lengths_kv"] is metadata.actual_seq_lengths_q
+    else:
+        assert kwargs["block_size"] == 16
+        assert kwargs["key"].data_ptr() == impl.key_cache.data_ptr()
+        assert kwargs["actual_seq_lengths_kv"] is metadata.seq_lens_list
+
+
+def test_swa_decode_uses_fia_even_when_paged_attention_shape_matches() -> None:
+    impl = _impl(_config(pa_shape_list=[1]))
+    impl.sliding_window = 16
+    calls = []
+    impl.forward_paged_attention = lambda *args: pytest.fail("SWA selected PA")
+    impl.forward_fused_infer_attention = lambda *args: calls.append(args) or args[4]
+    output = torch.empty(1, 4, 8)
+    result = attention.AscendAttentionBackendImpl.forward_impl(
+        impl, output, object(), object(), (), _metadata(), output
+    )
+    assert result is output
+    assert len(calls) == 1
+
+
+def test_swa_model_replay_uses_each_layers_live_lengths_and_captured_table(
+    monkeypatch, graph_task_runtime
+) -> None:
+    op_calls = []
+    monkeypatch.setattr(
+        attention.torch_npu, "_npu_fused_infer_attention_score_get_max_workspace",
+        lambda **kwargs: torch.empty(1),
+    )
+    monkeypatch.setattr(
+        attention.torch_npu, "npu_fused_infer_attention_score",
+        SimpleNamespace(out=lambda **kwargs: op_calls.append(kwargs)),
+    )
+    prepare_graph_params(1)
+    config = _config()
+    config.model_config.hf_text_config.sliding_window = 16
+    captured = {}
+    for name, window in [("local", 16), ("global", None)]:
+        impl = _impl(config)
+        impl.sliding_window = window
+        captured[name] = _metadata()
+        query = torch.empty(1, 4, 8)
+        attention.AscendAttentionBackendImpl._capture_fused_infer_attention(
+            impl, query, object(), object(), captured[name],
+            torch.empty_like(query), SimpleNamespace(layer_name=name),
+        )
+    # Metadata dictionary order is independent of capture order.
+    live = {"global": _metadata(20), "local": _metadata(10)}
+    live["global"].actual_seq_lengths_q = [2]
+    attention.AscendAttentionBackendImpl.update_graph_params(
+        object(), SimpleNamespace(attn_metadata=live), 1, config
+    )
+    for kwargs, name, mode in zip(op_calls[-2:], ["local", "global"], [4, 3]):
+        assert kwargs["actual_seq_lengths_kv"] is live[name].seq_lens_list
+        assert kwargs["actual_seq_lengths"] is live[name].actual_seq_lengths_q
+        assert kwargs["block_table"] is captured[name].block_tables
+        assert kwargs["sparse_mode"] == mode
