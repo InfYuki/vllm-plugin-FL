@@ -1,5 +1,6 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 
+import __future__
 import ast
 from enum import Enum, auto
 from pathlib import Path
@@ -22,6 +23,152 @@ MOE = (
 
 def _source(name: str) -> str:
     return (MOE / name).read_text(encoding="utf-8")
+
+
+def _exec_source_definitions(source, names, scope):
+    """Execute product functions, injecting only their runtime dependencies."""
+    class RemoveImports(ast.NodeTransformer):
+        def visit_ImportFrom(self, node):
+            return None
+
+    tree = ast.parse(source)
+    definitions = [node for node in tree.body if getattr(node, "name", None) in names]
+    assert {node.name for node in definitions} == set(names)
+    module = ast.Module(body=definitions, type_ignores=[])
+    module = ast.fix_missing_locations(RemoveImports().visit(module))
+    # Annotation evaluation is disabled independently of the import transformer.
+    exec(compile(module, "actual_ascend_moe_contract", "exec", flags=__future__.annotations.compiler_flag), scope)
+
+
+def _registry_scope():
+    context = (ROOT / "vllm_fl" / "ascend_forward_context.py").read_text(encoding="utf-8")
+    scope = {"Enum": Enum, "_MoECommMethods": {}, "constructor_calls": []}
+    _exec_source_definitions(context, ["MoECommType"], scope)
+    for name in ("AllGatherCommImpl", "MC2CommImpl", "AlltoAllCommImpl", "FusedMC2CommImpl"):
+        def constructor(config, name=name):
+            scope["constructor_calls"].append((name, config))
+            return SimpleNamespace(implementation=name, config=config)
+        scope[name] = constructor
+    _exec_source_definitions(
+        _source("moe_comm_method.py"),
+        ["setup_moe_comm_method", "get_moe_comm_method", "is_moe_comm_method_available"],
+        scope,
+    )
+    return scope
+
+
+@pytest.mark.parametrize("ep_size", [1, 2, 4, 16, 32, 64])
+def test_actual_registry_setup_and_lookup(ep_size):
+    scope = _registry_scope()
+    config = SimpleNamespace(ep_size=ep_size)
+    scope["setup_moe_comm_method"](config)
+    comm_type = scope["MoECommType"]
+    expected = {comm_type.ALLGATHER} if ep_size == 1 else set(comm_type)
+    assert set(scope["_MoECommMethods"]) == expected
+    assert len(scope["constructor_calls"]) == len(expected)
+    assert all(config is called_config for _, called_config in scope["constructor_calls"])
+    for method in comm_type:
+        assert scope["is_moe_comm_method_available"](method) == (method in expected)
+        if method in expected:
+            assert scope["get_moe_comm_method"](method) is scope["_MoECommMethods"][method]
+        else:
+            with pytest.raises(NotImplementedError, match=method.name):
+                scope["get_moe_comm_method"](method)
+    assert scope["get_moe_comm_method"](None) is None
+    assert not scope["is_moe_comm_method_available"](None)
+
+
+def test_actual_registry_reinitialization_clears_stale_ep_transports():
+    scope = _registry_scope()
+    scope["setup_moe_comm_method"](SimpleNamespace(ep_size=16))
+    scope["constructor_calls"].clear()
+    config = SimpleNamespace(ep_size=1)
+    scope["setup_moe_comm_method"](config)
+    assert scope["constructor_calls"] == [("AllGatherCommImpl", config)]
+    assert set(scope["_MoECommMethods"]) == {scope["MoECommType"].ALLGATHER}
+    for name in ("MC2", "FUSED_MC2", "ALLTOALL"):
+        method = scope["MoECommType"][name]
+        assert not scope["is_moe_comm_method_available"](method)
+        with pytest.raises(NotImplementedError, match=name):
+            scope["get_moe_comm_method"](method)
+
+
+@pytest.mark.parametrize("device_name", ["A2", "A3"])
+@pytest.mark.parametrize("ep_size", [1, 2, 4, 16, 32, 64])
+@pytest.mark.parametrize("enable_fused_mc2", [0, 1])
+@pytest.mark.parametrize("num_tokens,capacity", [(1, 8), (8, 8), (9, 8), (1, None)])
+def test_actual_selector_resolves_registered_transport(
+    device_name, ep_size, enable_fused_mc2, num_tokens, capacity
+):
+    scope = _registry_scope()
+    config = SimpleNamespace(
+        ep_size=ep_size,
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True, world_size_across_dp=ep_size,
+            pipeline_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(get_num_experts=lambda: 128),
+    )
+    scope["setup_moe_comm_method"](config)
+    device_type = Enum("AscendDeviceType", ["A2", "A3", "A5", "_310P"])
+    scope.update(
+        AscendDeviceType=device_type,
+        _is_moe_model=lambda config: True,
+        _active_ep_world_size=lambda: ep_size,
+        _get_ascend_device_type=lambda: device_type[device_name],
+        get_mc2_tokens_capacity=lambda: capacity,
+        get_ascend_config=lambda: SimpleNamespace(enable_fused_mc2=enable_fused_mc2),
+    )
+    context = (ROOT / "vllm_fl" / "ascend_forward_context.py").read_text(encoding="utf-8")
+    _exec_source_definitions(
+        context,
+        ["_ep_world_size", "_select_a2_moe_comm_method", "_select_a3_moe_comm_method", "select_moe_comm_method"],
+        scope,
+    )
+    selected = scope["select_moe_comm_method"](num_tokens, config)
+    comm_type = scope["MoECommType"]
+    if ep_size == 1:
+        expected = comm_type.ALLGATHER
+    elif device_name == "A2":
+        expected = (
+            comm_type.MC2
+            if ep_size >= 16 and capacity is not None and num_tokens <= capacity
+            else comm_type.ALLGATHER
+        )
+    elif enable_fused_mc2 and ep_size <= 32 and capacity is not None:
+        expected = comm_type.FUSED_MC2
+    elif capacity is not None and num_tokens <= capacity:
+        expected = comm_type.MC2
+    else:
+        expected = comm_type.ALLTOALL
+    assert selected == expected
+    assert scope["is_moe_comm_method_available"](selected)
+    assert scope["get_moe_comm_method"](selected).config is config
+
+    # The same real selector must bypass device transport selection for these boundaries.
+    config.parallel_config.enable_expert_parallel = False
+    assert scope["select_moe_comm_method"](num_tokens, config) == comm_type.ALLGATHER
+    scope["_is_moe_model"] = lambda config: False
+    assert scope["select_moe_comm_method"](num_tokens, config) is None
+    assert scope["get_moe_comm_method"](None) is None
+
+
+def test_runner_initializes_groups_before_registry_setup():
+    tree = ast.parse(_source("fused_moe.py"))
+    runner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendMoERunner")
+    constructor = next(node for node in runner.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    setup = next(
+        node for node in ast.walk(constructor)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "setup_moe_comm_method"
+    )
+    assert ast.unparse(setup.args[0]) == "self.moe_config"
+    for name in ("get_tp_group", "get_dp_group", "get_ep_group"):
+        group_call = next(
+            node for node in ast.walk(constructor)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+        )
+        assert group_call.lineno < setup.lineno
 
 
 @pytest.mark.parametrize("quant_name", ["NONE", "W8A8", "W4A8"])
