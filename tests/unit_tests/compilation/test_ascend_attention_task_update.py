@@ -1,7 +1,6 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 """CPU contract tests using the real Ascend module with isolated NPU mocks."""
 
-import importlib
 import sys
 from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
@@ -12,34 +11,7 @@ import torch
 
 
 @pytest.fixture
-def runtime(monkeypatch):
-    # Load real vLLM dependencies before replacing only the hardware module.
-    import vllm.model_executor.models.config as model_config
-    import vllm.v1.attention.backends.registry as registry
-
-    import vllm_fl.compilation.graph  # noqa: F401
-
-    prefix = "vllm_fl.dispatch.backends.vendor.ascend"
-    before = {
-        name: mod
-        for name, mod in sys.modules.items()
-        if name == prefix or name.startswith(prefix + ".")
-    }
-    parent = importlib.import_module("vllm_fl.dispatch.backends.vendor")
-    missing = object()
-    old_parent = getattr(parent, "ascend", missing)
-    cls = model_config.HybridAttentionMambaModelConfig
-    # Preserve the descriptor, not a bound method.
-    old_verify = cls.__dict__["verify_and_update_config"]
-    for name in before:
-        monkeypatch.delitem(sys.modules, name)
-    monkeypatch.setattr(registry, "register_backend", Mock())
-    for owner, name in (
-        (torch, "Event"),
-        (torch.cuda, "Event"),
-        (torch.cuda, "Stream"),
-    ):
-        monkeypatch.setattr(owner, name, getattr(owner, name))
+def runtime(monkeypatch, ascend_attention_module):
     state = SimpleNamespace(
         events={2: []},
         handles={2: []},
@@ -79,28 +51,18 @@ def runtime(monkeypatch):
     )
     hardware = ModuleType("torch_npu")
     hardware.__dict__.update(vars(ops))
-    monkeypatch.setitem(sys.modules, "torch_npu", hardware)
-    monkeypatch.setattr(torch, "npu", npu, raising=False)
-    try:
-        module = importlib.import_module(prefix + ".impl.attention")
+    with monkeypatch.context() as runtime_patch:
+        runtime_patch.setitem(sys.modules, "torch_npu", hardware)
+        runtime_patch.setattr(torch, "npu", npu, raising=False)
+        module = ascend_attention_module(fresh=True)
         ns = vars(module)
         ns["capturing"] = True
-        monkeypatch.setattr(module, "get_ascend_graph_params", lambda: state)
-        monkeypatch.setattr(
+        runtime_patch.setattr(module, "get_ascend_graph_params", lambda: state)
+        runtime_patch.setattr(
             module, "is_ascend_graph_capturing", lambda: ns["capturing"]
         )
-        monkeypatch.setattr(module, "weak_ref_tensors", lambda tensor: tensor)
+        runtime_patch.setattr(module, "weak_ref_tensors", lambda tensor: tensor)
         yield SimpleNamespace(ns=ns, state=state, calls=calls, npu=npu, ops=ops)
-    finally:
-        cls.verify_and_update_config = old_verify
-        for name in list(sys.modules):
-            if name == prefix or name.startswith(prefix + "."):
-                del sys.modules[name]
-        sys.modules.update(before)
-        if old_parent is missing:
-            vars(parent).pop("ascend", None)
-        else:
-            parent.ascend = old_parent
 
 
 def _metadata(rt, length=6):

@@ -2,9 +2,7 @@
 """Real NPU task capture/update/replay against the native eager attention path."""
 
 import importlib
-import sys
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -21,33 +19,14 @@ def ascend_runtime(backend, request, monkeypatch):
     if not torch.npu.is_available():
         pytest.skip("Ascend NPU is unavailable")
     device = request.getfixturevalue("device")
-    import vllm.model_executor.models.config as model_config
-    import vllm.v1.attention.backends.registry as registry
+    load_attention = request.getfixturevalue("ascend_attention_module")
 
     import vllm_fl.compilation.graph as graph_state
 
-    prefix = "vllm_fl.dispatch.backends.vendor.ascend"
-    before = {
-        name: mod
-        for name, mod in sys.modules.items()
-        if name == prefix or name.startswith(prefix + ".")
-    }
-    parent = importlib.import_module("vllm_fl.dispatch.backends.vendor")
-    missing = object()
-    old_parent = getattr(parent, "ascend", missing)
-    cls = model_config.HybridAttentionMambaModelConfig
-    old_verify = cls.__dict__["verify_and_update_config"]
-    monkeypatch.setattr(registry, "register_backend", Mock())
-    for owner, name in (
-        (torch, "Event"),
-        (torch.cuda, "Event"),
-        (torch.cuda, "Stream"),
-    ):
-        monkeypatch.setattr(owner, name, getattr(owner, name))
     monkeypatch.setattr(graph_state, "_ascend_graph_params", None)
     monkeypatch.setattr(graph_state, "_ascend_graph_capturing", False)
     try:
-        attention = importlib.import_module(prefix + ".impl.attention")
+        attention = load_attention()
         with torch.npu.device(device):
             torch.npu.synchronize()
             yield attention, graph_state, device
@@ -56,14 +35,6 @@ def ascend_runtime(backend, request, monkeypatch):
         torch.npu.synchronize()
         graph_state.set_ascend_graph_capturing(False)
         graph_state._ascend_graph_params = None
-        cls.verify_and_update_config = old_verify
-        for name in list(sys.modules):
-            if (name == prefix or name.startswith(prefix + ".")) and name not in before:
-                del sys.modules[name]
-        if old_parent is missing:
-            vars(parent).pop("ascend", None)
-        else:
-            parent.ascend = old_parent
 
 
 @pytest.mark.parametrize("batch", [1, 2])
