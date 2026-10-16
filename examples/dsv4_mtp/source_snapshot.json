@@ -77,7 +77,7 @@
     {
       "path": "vllm_fl/compilation/compiler_interface.py",
       "before_sha256": "78733f640b9a8e186a9b633aad68ea8a034d0a7d32570c6af2ce42c8129c539e",
-      "sha256": "b0d703269d21ba29138b44e6a0f2dd4f432732c6300638090c8b1bde8959a76d"
+      "sha256": "731d955ddffa2f01904ab6ac17fe4942ea3352d5cddc00df29fc38bbbc67db0a"
     },
     {
       "path": "vllm_fl/worker/worker.py",
@@ -109,7 +109,7 @@
   ],
   "runtime_vllm": "ee0da84ab9e04ac7610e28580af62c365e898389",
   "reference_vllm_ascend": "412cda26814ff70c326f6eb6510f1b610f67bbc0",
-  "validation": "Static-kernel candidate: AST, bash syntax, isolated configuration/topology/rollback checks and source hashes passed; no device imports, service actions, inference or benchmarks.",
+  "validation": "Static cached-logger regression reproduced the startup TypeError before fix; fixed version passed isolated configuration, syntax and hash checks. No service, device runtime or benchmark executed.",
   "constraints": {
     "method": "mtp",
     "draft_tokens": [
@@ -223,6 +223,12 @@
     "scope": "target npugraph_ex decode static kernels; eager MTP unchanged",
     "validation": "static checks passed; precision/performance and actual kernel selection unverified",
     "gmm_fusion": "deferred: native binding absent; backend opt remains disabled",
-    "moe_layer_index": "existing wrap guard connected to static kernel flag, matching upstream"
+    "moe_layer_index": "existing wrap guard connected to static kernel flag, matching upstream",
+    "startup_log_fix": {
+      "failed_commit": "2a8b384018c0fb34accd47ceea4360053562bbe7",
+      "root_cause": "info_once cache received unhashable list; other Gloo errors are secondary",
+      "fix": "tuple only for logging; compiler range remains list",
+      "validation": "stdlib cached-logger regression reproduced before fix and passed after fix; no runtime startup or benchmark"
+    }
   }
 }

@@ -105,7 +105,7 @@ def _configure_npugraph_ex(
         options["_vllm_aclnn_static_kernel_sym_range"] = sizes
         logger.info_once(
             "FL static kernel enabled: LOCAL_WORLD_SIZE=%d, decode sizes=%s",
-            local_world_size, sizes, scope="global",
+            local_world_size, tuple(sizes), scope="global",
         )
     process_kwargs_options(config, {"options": options})
 
