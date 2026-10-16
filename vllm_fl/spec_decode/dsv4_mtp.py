@@ -5,6 +5,9 @@ from copy import copy
 from dataclasses import fields, replace
 
 import torch
+import numpy as np
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import set_forward_context
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -26,6 +29,17 @@ class Dsv4MTPProposer(EagleProposer):
             (vllm_config.additional_config or {}).get("dsv4_mtp_fast_metadata", False))
         self._host_metadata_active = False
         self._pending_draft_counts = None
+        self._prepare_steps = (os.getenv("MTP_PREPARE_STEPS", "1") == "1"
+                               and self._fast_mtp_metadata)
+        self._fused_inputs = os.getenv("MTP_FUSED_INPUTS", "1") == "1"
+        self.use_local_argmax_reduction = os.getenv("MTP_LOCAL_ARGMAX", "1") == "1"
+        self._step_buffers = [
+            (torch.empty(self.max_batch_size, dtype=torch.int64, device=device),
+             torch.empty(self.max_batch_size, dtype=self._slot_mapping_buffer.dtype, device=device),
+             torch.empty(self.max_batch_size, dtype=torch.int32, device=device),
+             torch.empty(self.max_batch_size, dtype=torch.bool, device=device))
+            for _ in range(2)
+        ]
 
     def _get_model(self):
         # Installed vLLM copies the target's eager flag when constructing the
@@ -48,7 +62,26 @@ class Dsv4MTPProposer(EagleProposer):
                   is_graph_capturing=False, slot_mappings=None):
         if is_graph_capturing:
             return
-        return super().dummy_run(num_tokens, False, False, slot_mappings)
+        if not self._prepare_steps:
+            return super().dummy_run(num_tokens, False, False, slot_mappings)
+        # Idle DP ranks must use exactly the same packed collective and K
+        # forwards as real ranks. Startup/profile also use this path.
+        first, follow = self._coordinate_step_sizes(num_tokens, num_tokens)
+        for step in range(self.num_speculative_tokens):
+            mode, count, across = first if step == 0 else follow
+            if (self._draft_attn_layer_names and slot_mappings
+                    and next(iter(self._draft_attn_layer_names)) in slot_mappings):
+                slots = self._get_slot_mapping(count)
+            else:
+                slots = slot_mappings or {}
+            with set_forward_context(
+                None, self.vllm_config, num_tokens=count,
+                num_tokens_across_dp=across, cudagraph_runtime_mode=mode,
+                slot_mapping=slots):
+                self.model(input_ids=self.input_ids[:count],
+                           positions=self._get_positions(count),
+                           hidden_states=self.hidden_states[:count],
+                           inputs_embeds=None)
 
     def propose(self, *args, **kwargs):
         sampling = kwargs.get("sampling_metadata", args[7] if len(args) > 7 else None)
@@ -78,11 +111,123 @@ class Dsv4MTPProposer(EagleProposer):
         else:
             args[6] = cad
         try:
+            if self._prepare_steps:
+                return self._propose_prepared(*args, **kwargs)
             return super().propose(*args, **kwargs)
         finally:
             # Dummy/profile forwards must never reuse a previous real batch.
             self._host_metadata_active = False
             self._pending_draft_counts = None
+
+    def _coordinate_step_sizes(self, first_tokens, follow_tokens):
+        """One eager DP collective carrying both forward extents.
+
+        dummy_run uses the same layout/order so idle DP ranks participate.
+        Graph and microbatch modes stay disabled for this draft-only path.
+        """
+        parallel = self.vllm_config.parallel_config
+        if parallel.data_parallel_size == 1:
+            return ((CUDAGraphMode.NONE, first_tokens, None),
+                    (CUDAGraphMode.NONE, follow_tokens, None))
+        from vllm.v1.worker.dp_utils import _get_device_and_group
+        import torch.distributed as dist
+        device, group = _get_device_and_group(parallel)
+        sizes = torch.zeros((2, parallel.data_parallel_size), dtype=torch.int32)
+        sizes[:, parallel.data_parallel_rank] = torch.tensor([first_tokens, follow_tokens])
+        packed = sizes.to(device, non_blocking=True)
+        dist.all_reduce(packed, group=group)
+        sizes = packed.cpu()
+        return ((CUDAGraphMode.NONE, first_tokens, sizes[0]),
+                (CUDAGraphMode.NONE, follow_tokens, sizes[1]))
+
+    def _propose_prepared(self, num_speculative_tokens, target_token_ids,
+                          target_positions, target_hidden_states, next_token_ids,
+                          token_indices_to_sample, common_attn_metadata,
+                          sampling_metadata, mm_embed_inputs=None,
+                          num_rejected_tokens_gpu=None, slot_mappings=None):
+        """Prepare all K metadata snapshots before the first draft forward."""
+        if self.needs_extra_input_slots or self.uses_mrope or self.supports_mm_inputs:
+            raise NotImplementedError("DSv4 prepared steps require plain sequential text MTP")
+        if not 1 <= num_speculative_tokens <= 3:
+            raise ValueError("DSv4 prepared steps require K1..3")
+        self.num_speculative_tokens = num_speculative_tokens
+        self._last_draft_probs = None
+        batch = common_attn_metadata.batch_size()
+        num_tokens, indices, cad = self.set_inputs_first_pass(
+            target_token_ids, next_token_ids, target_positions,
+            target_hidden_states, token_indices_to_sample,
+            common_attn_metadata, num_rejected_tokens_gpu)
+        _, first_metadata = self.build_per_group_and_layer_attn_metadata(cad)
+        first_size, follow_size = self._coordinate_step_sizes(num_tokens, batch)
+        first_inputs, slot_size = self.build_model_inputs_first_pass(
+            num_tokens, first_size[1], mm_embed_inputs)
+
+        plans = []
+        if num_speculative_tokens > 1:
+            follow = copy(cad)
+            follow.num_actual_tokens = batch
+            follow.num_input_tokens = batch
+            follow.max_query_len = 1
+            follow.query_start_loc = self.arange[:batch + 1]
+            follow.query_start_loc_cpu = torch.from_numpy(self.token_arange_np[:batch + 1])
+            if num_rejected_tokens_gpu is not None:
+                follow.seq_lens = cad.seq_lens - num_rejected_tokens_gpu
+            positions = self.positions[indices]
+            active = None
+            for step in range(1, num_speculative_tokens):
+                # This waits on the existing accepted-count event once, before
+                # any draft forward, and keeps CPU/GPU correction identical.
+                self._advance_host_metadata(follow, batch, self.block_size)
+                if self._fused_inputs:
+                    from .dsv4_mtp_kernels import advance_positions
+                    positions, slots, lengths, active = advance_positions(
+                        positions, follow.block_table_tensor, follow.seq_lens,
+                        self.block_size, self.max_model_len, active,
+                        self._step_buffers[step - 1])
+                else:
+                    positions, slots, lengths = advance_draft_positions(
+                        positions, follow.block_table_tensor, follow.seq_lens,
+                        self.block_size, self.max_model_len, active)
+                    active = slots >= 0
+                follow = copy(follow)
+                follow.slot_mapping = slots
+                follow.seq_lens = lengths
+                _, metadata = self.build_per_group_and_layer_attn_metadata(
+                    follow, draft_index=step, positions=positions)
+                plans.append((positions, slots, metadata))
+
+        # Input/position/hidden buffers for step zero have not been overwritten
+        # by metadata preparation. Each later step owns its metadata storage.
+        mode, count, across = first_size
+        with set_forward_context(
+            first_metadata, self.vllm_config, num_tokens=count,
+            num_tokens_across_dp=across, cudagraph_runtime_mode=mode,
+            slot_mapping=self._get_slot_mapping(slot_size, cad.slot_mapping)):
+            hidden = self.model(**first_inputs)
+        if self.model_returns_tuple():
+            raise NotImplementedError("DSv4 draft returns its single pre-HC hidden tensor")
+        selected = hidden[indices]
+        ids = self._greedy_sample(selected)
+        output = torch.empty((batch, num_speculative_tokens), dtype=ids.dtype, device=ids.device)
+        output[:, 0].copy_(ids)
+        hidden = selected
+        mode, count, across = follow_size
+        for step, (positions, slots, metadata) in enumerate(plans, 1):
+            self.input_ids[:batch].copy_(ids)
+            self.positions[:batch].copy_(positions)
+            self.hidden_states[:batch].copy_(hidden)
+            with set_forward_context(
+                metadata, self.vllm_config, num_tokens=count,
+                num_tokens_across_dp=across, cudagraph_runtime_mode=mode,
+                slot_mapping=self._get_slot_mapping(count, slots)):
+                hidden = self.model(input_ids=self.input_ids[:count],
+                                    positions=self._get_positions(count),
+                                    hidden_states=self.hidden_states[:count],
+                                    inputs_embeds=None)
+            hidden = hidden[:batch]
+            ids = self._greedy_sample(hidden)
+            output[:, step].copy_(ids)
+        return output
 
     def prepare_next_token_ids_padded(self, sampled_token_ids, requests,
                                       gpu_input_batch, discard_request_mask):
@@ -94,13 +239,21 @@ class Dsv4MTPProposer(EagleProposer):
         # The runner passes a max_num_reqs-sized mask, while the sampled
         # token tensor contains only active requests. Slice before torch.where
         # to prevent a one-request batch broadcasting to the full capacity.
+        if self._fused_inputs and sampled_token_ids.device.type in ("npu", "privateuseone"):
+            from .dsv4_mtp_kernels import next_tokens
+            return next_tokens(sampled_token_ids[:batch], discard_request_mask[:batch],
+                               self.backup_next_token_ids.gpu[:batch], gpu_input_batch.vocab_size)
         return resolve_next_tokens(sampled_token_ids[:batch], discard_request_mask[:batch],
                                    self.backup_next_token_ids.gpu[:batch],
                                    gpu_input_batch.vocab_size)
 
     def prepare_inputs_padded(self, common_attn_metadata, spec_decode_metadata,
                               valid_sampled_tokens_count):
-        indices, rejected = padded_draft_indices(
+        prepare = padded_draft_indices
+        if self._fused_inputs and valid_sampled_tokens_count.device.type in ("npu", "privateuseone"):
+            from .dsv4_mtp_kernels import padded_indices
+            prepare = padded_indices
+        indices, rejected = prepare(
             spec_decode_metadata.cu_num_draft_tokens,
             valid_sampled_tokens_count, common_attn_metadata.query_start_loc)
         # Preserve Ascend positions, phase and CPU mirrors, not just base fields.
@@ -144,38 +297,47 @@ class Dsv4MTPProposer(EagleProposer):
                 if self.runner is None or self._pending_draft_counts is None:
                     raise RuntimeError("Missing DSv4 rejection-count owner")
                 counts = self.runner._get_valid_sampled_token_count()
-                drafts = torch.tensor(self._pending_draft_counts, dtype=torch.int32)
-                valid = torch.tensor(counts, dtype=torch.int32)
-                if valid.shape != drafts.shape or valid.numel() != batch_size:
+                drafts = np.asarray(self._pending_draft_counts, dtype=np.int32)
+                valid = np.asarray(counts, dtype=np.int32)
+                if valid.shape != drafts.shape or valid.size != batch_size:
                     raise RuntimeError("DSv4 acceptance-count rows do not match the draft batch")
-                if torch.any((valid < 0) | (valid > drafts + 1)):
+                if np.any((valid < 0) | (valid > drafts + 1)):
                     raise RuntimeError("DSv4 acceptance count exceeds the previous draft extent")
-                rejected = torch.where(drafts > 0, drafts + 1 - valid, 0)
-                ends = ends - rejected
-                self._host_lengths = self._host_lengths - rejected
+                rejected = np.where(drafts > 0, drafts + 1 - valid, 0)
+                ends = ends - torch.from_numpy(rejected)
+                self._host_lengths = self._host_lengths - torch.from_numpy(rejected)
             self._host_sampling_positions = self._host_positions[ends.long()]
 
-        # This is the host mirror of the same kernel-block table used by the
-        # GPU path, including hybrid block splitting and row compaction.
         if self.runner is None:
             raise RuntimeError("DSv4 MTP requires the runner's CPU block table")
         table = self.runner.input_batch.block_table[self.kv_cache_gid]
         if table.block_size != block_size:
             raise RuntimeError("DSv4 host/GPU kernel block sizes differ")
-        host_table = table.get_cpu_tensor()[:batch_size, :cad.block_table_tensor.shape[1]]
-        positions, slots, lengths = advance_draft_positions(
-            self._host_sampling_positions, host_table, self._host_lengths,
-            block_size, self.max_model_len, self._host_active_mask)
-        self._host_sampling_positions = positions
-        self._host_positions = positions
-        self._host_lengths = lengths
-        self._host_active_mask = slots >= 0
+        host_table = table.get_cpu_tensor()[:batch_size, :cad.block_table_tensor.shape[1]].numpy()
+        pos = self._host_sampling_positions.numpy().astype(np.int64, copy=False) + 1
+        valid = (pos >= 0) & (pos < self.max_model_len)
+        if self._host_active_mask is not None:
+            valid &= self._host_active_mask.numpy()
+        cols = host_table.shape[1]
+        if cols:
+            column = np.minimum(np.maximum(pos, 0) // block_size, cols - 1)
+            valid &= (pos // block_size < cols)
+            valid &= host_table[np.arange(batch_size), column] >= 0
+        else:
+            valid[:] = False
+        positions = np.where(valid, pos, 0)
+        lengths = np.where(valid, np.minimum(self._host_lengths.numpy() + 1, self.max_model_len), 1)
+        self._host_sampling_positions = torch.from_numpy(positions)
+        self._host_positions = self._host_sampling_positions
+        self._host_lengths = torch.from_numpy(lengths.astype(np.int32, copy=False))
+        self._host_active_mask = torch.from_numpy(valid)
 
-    def build_per_group_and_layer_attn_metadata(self, common_attn_metadata, draft_index=0):
+    def build_per_group_and_layer_attn_metadata(self, common_attn_metadata, draft_index=0,
+                                               positions=None):
         from vllm_fl.attention.ascend.dsa_v1 import AscendDSAMetadataBuilder
         cad = common_attn_metadata
         count = cad.num_actual_tokens
-        cad.positions = self.positions[:count]
+        cad.positions = self.positions[:count] if positions is None else positions[:count]
         if self._host_metadata_active:
             cad.positions_cpu = self._host_positions[:count]
             lengths = self._host_lengths

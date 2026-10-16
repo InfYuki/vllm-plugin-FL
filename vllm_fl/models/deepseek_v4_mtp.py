@@ -212,6 +212,17 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         return logits
 
 
+    def get_top_tokens(self, hidden_states, spec_step_idx=0):
+        # Draft-only local reduction. Keep the same hc_head/norm and the
+        # installed vLLM shard-padding/tie-breaking implementation.
+        layer = self.layers[str(spec_step_idx % self.num_mtp_layers)]
+        hidden_states = hidden_states.view(-1, layer.hc_mult, layer.config.hidden_size)
+        hidden_states = layer.hc_head(
+            hidden_states, layer.hc_head_fn, layer.hc_head_scale, layer.hc_head_base)
+        return self.logits_processor.get_top_tokens(
+            layer.shared_head.head, layer.shared_head(hidden_states))
+
+
 class AscendDeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -273,6 +284,9 @@ class AscendDeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def get_top_tokens(self, hidden_states):
+        return self.model.get_top_tokens(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = getattr(get_ascend_config(), "mix_placement", False)

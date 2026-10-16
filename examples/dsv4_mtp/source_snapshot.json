@@ -22,7 +22,7 @@
     {
       "path": "vllm_fl/models/deepseek_v4_mtp.py",
       "before_sha256": null,
-      "sha256": "f5b5618f7bdd459a896fdb5f830dda7e22018fdd66baf7385095322a82365ce7"
+      "sha256": "395490971f3a7bb3be3970d6c7734168fc082d2d6fd1b22fc09ad931baee583a"
     },
     {
       "path": "vllm_fl/spec_decode/__init__.py",
@@ -32,12 +32,12 @@
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp.py",
       "before_sha256": null,
-      "sha256": "4313247ccc359ede4a62750047b3f1ae753ec3db3f24e7aca92588b58a121e17"
+      "sha256": "33c9285f7afd7cf26d0b7ffe38f3ce11113e3cfe55e8fea4b8d5eb242725d1cc"
     },
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp_utils.py",
       "before_sha256": null,
-      "sha256": "150b9287ec5dd2a24cc9c71f98b51d70a94ebe2559add74d26e737a30a766fa0"
+      "sha256": "b1b4b6993913ddaa5f2d06eb1039ea1115b75f7933b2fd31f71982e3041115db"
     },
     {
       "path": "vllm_fl/attention/ascend/dsa_v1.py",
@@ -48,6 +48,11 @@
       "path": "vllm_fl/spec_decode/dsv4_mtp_greedy.py",
       "before_sha256": null,
       "sha256": "d409c6cfdc2718270249df748879910f83e62ebb6a61d33cf775206f33a00d00"
+    },
+    {
+      "path": "vllm_fl/spec_decode/dsv4_mtp_kernels.py",
+      "before_sha256": null,
+      "sha256": "00a72a706c1550c98d749fabb265b561b03413e1ec1a4a52ff6a22f2d9508c57"
     }
   ],
   "preserved": [],
@@ -64,7 +69,7 @@
   ],
   "runtime_vllm": "ee0da84ab9e04ac7610e28580af62c365e898389",
   "reference_vllm_ascend": "412cda26814ff70c326f6eb6510f1b610f67bbc0",
-  "validation": "Fused greedy candidate is UNTESTED per user request; previous checks cover the previous layer only",
+  "validation": "Batch optimization candidates added; NOT TESTED; user will validate.",
   "constraints": {
     "method": "mtp",
     "draft_tokens": [
@@ -116,5 +121,14 @@
     "tested": false,
     "scope": "Greedy prefix verification/output only; existing GPU cumulative draft counts",
     "unchanged": "Logits processors, vocabulary argmax, bonus sampling, proposer, graph and scheduling"
+  },
+  "mtp_batch_optimization": {
+    "tested": false,
+    "prepare_steps_default": true,
+    "fused_inputs_default": true,
+    "draft_local_argmax_default": true,
+    "draft_graph": "eager",
+    "warmup_requests_per_performance_round": 64,
+    "note": "Prepared steps require the existing fast metadata path; independent fallback switches."
   }
 }

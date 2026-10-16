@@ -149,6 +149,10 @@ pid=int(sys.argv[1]);stamp=pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(
 path=pathlib.Path(sys.argv[2]); record={'pid':pid,'starttime':stamp}
 path.write_text(json.dumps(record))
 record.update(variant=sys.argv[3],port=int(sys.argv[4]),graph=int(sys.argv[5]),experiment='dsv4_mtp_infyuki_20261015',timestamp=time.time(),manifest_sha256=hashlib.sha256((path.parents[2]/'manifest.json').read_bytes()).hexdigest())
+record.update(
+ dsv4_mtp_prepared_steps=sys.argv[3].startswith('mtp') and os.getenv('MTP_PREPARE_STEPS','1')=='1' and os.getenv('MTP_FAST_METADATA','1')=='1',
+ dsv4_mtp_fused_inputs=sys.argv[3].startswith('mtp') and os.getenv('MTP_FUSED_INPUTS','1')=='1',
+ dsv4_mtp_local_argmax=sys.argv[3].startswith('mtp') and os.getenv('MTP_LOCAL_ARGMAX','1')=='1')
 record.update(dsv4_mtp_fused_greedy=sys.argv[3].startswith('mtp') and os.getenv('MTP_FUSED_GREEDY','1')=='1',dsv4_mtp_fast_metadata=sys.argv[3].startswith('mtp') and os.getenv('MTP_FAST_METADATA','1')=='1',async_scheduling=sys.argv[6]=='1',compilation_config=json.loads(sys.argv[7]),enable_dsv4_mtp=sys.argv[3].startswith('mtp'),launch_script_sha256=hashlib.sha256((path.parents[2]/'serve_in_container.sh').read_bytes()).hexdigest(),launch_config_sha256=hashlib.sha256((path.parents[2]/'launch_config.py').read_bytes()).hexdigest())
 path.with_name('launch_metadata.json').write_text(json.dumps(record,indent=2))
 PY

@@ -8,6 +8,10 @@ case "$MODE" in accuracy|performance) ;; *) echo 'mode: accuracy|performance' >&
 CONTAINER=${CONTAINER:-fl-infyuki-v024-hzj}
 # This directory is bind-mounted at both paths. Allow execution on host or in container.
 if [[ ! -x /opt/aisbench-venv/bin/ais_bench ]]; then
+  if [[ -f /.dockerenv ]]; then
+    echo "Missing /opt/aisbench-venv/bin/ais_bench in container. Restore the AISBench environment before running this script." >&2
+    exit 1
+  fi
   TARGET=${CONTAINER_DIR:-/workspace/model_test/dsv4-mtp-infyuki-20261015/aisbench}
   exec docker exec -i \
     -e PORT="${PORT:-1112}" -e HOST_IP="${HOST_IP:-127.0.0.1}" \
@@ -17,6 +21,7 @@ if [[ ! -x /opt/aisbench-venv/bin/ais_bench ]]; then
     -e OUTPUT_LEN="${OUTPUT_LEN:-1024}" -e SEED="${SEED:-1024}" \
     -e ACC_CC="${ACC_CC:-8}" -e ACC_MAX_OUT="${ACC_MAX_OUT:-8192}" \
     -e ACC_NUM="${ACC_NUM:-1319}" -e WAIT_SECONDS="${WAIT_SECONDS:-300}" \
+    -e WARMUP_REQUESTS="${WARMUP_REQUESTS:-64}" \
     -e API_KEY="${API_KEY:-}" \
     "$CONTAINER" bash "$TARGET/run.sh" "$VARIANT" "$MODE"
 fi
@@ -25,6 +30,7 @@ export MODEL_PATH=${MODEL_PATH:-/public-flash/models/DeepSeek-V4-Flash-w8a8-mtp}
 export CC=${CC:-64} NUM_REQUESTS=${NUM_REQUESTS:-256} OUTPUT_LEN=${OUTPUT_LEN:-1024} SEED=${SEED:-1024}
 export ACC_CC=${ACC_CC:-8} ACC_MAX_OUT=${ACC_MAX_OUT:-8192} ACC_NUM=${ACC_NUM:-1319}
 export WAIT_SECONDS=${WAIT_SECONDS:-300} API_KEY=${API_KEY:-}
+WARMUP_REQUESTS=${WARMUP_REQUESTS:-64}
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1
 export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1,::1,$HOST_IP"
 export no_proxy="$NO_PROXY"
@@ -51,8 +57,8 @@ else
     mkdir -p "$ROUND_OUT"
     echo "===== input=$INPUT_LEN output=$OUTPUT_LEN concurrency=$CC requests=$NUM_REQUESTS round=$ROUND/2 ====="
     "$PY" "$HERE/make_config.py" performance "$ROUND_OUT/config.py"
-    printf '%s\n' "$AIS $ROUND_OUT/config.py --mode perf --num-prompts $NUM_REQUESTS --num-warmups 0 --max-num-workers 1 --debug -w $ROUND_OUT/work" > "$ROUND_OUT/command.txt"
-    "$AIS" "$ROUND_OUT/config.py" --mode perf --num-prompts "$NUM_REQUESTS" --num-warmups 0 \
+    printf '%s\n' "$AIS $ROUND_OUT/config.py --mode perf --num-prompts $NUM_REQUESTS --num-warmups "$WARMUP_REQUESTS" --max-num-workers 1 --debug -w $ROUND_OUT/work" > "$ROUND_OUT/command.txt"
+    "$AIS" "$ROUND_OUT/config.py" --mode perf --num-prompts "$NUM_REQUESTS" --num-warmups "$WARMUP_REQUESTS" \
       --max-num-workers 1 --debug -w "$ROUND_OUT/work" 2>&1 | tee "$ROUND_OUT/console.log"
     "$PY" "$HERE/check_perf_result.py" "$ROUND_OUT" "$NUM_REQUESTS" "$INPUT_LEN" "$OUTPUT_LEN"
   done

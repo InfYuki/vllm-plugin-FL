@@ -16,6 +16,10 @@ def mtp_sequence_partition(value, rank, world_size, pad_size):
 
 def validate_dsv4_mtp_config(config):
     spec = config.speculative_config
+    import os
+    for name in ("MTP_PREPARE_STEPS", "MTP_FUSED_INPUTS", "MTP_LOCAL_ARGMAX"):
+        if os.getenv(name, "1") not in ("0", "1"):
+            raise ValueError(name + " must be 0 or 1")
     if not (config.additional_config or {}).get("enable_dsv4_mtp", False):
         raise NotImplementedError("DSv4 MTP requires additional_config.enable_dsv4_mtp=true")
     if (config.additional_config or {}).get("enable_dsa_cp", False):
@@ -24,8 +28,6 @@ def validate_dsv4_mtp_config(config):
         raise NotImplementedError("DSv4 supports sequential method=mtp with 1..3 draft tokens")
     if getattr(spec, "parallel_drafting", False):
         raise NotImplementedError("DSv4 parallel/tree drafting is not supported")
-    if getattr(spec, "use_local_argmax_reduction", False):
-        raise NotImplementedError("DSv4 MTP local argmax reduction is not implemented")
     if getattr(spec, "num_speculative_tokens_per_batch_size", None):
         raise NotImplementedError("DSv4 MTP currently requires a fixed draft token count")
     if getattr(spec, "draft_sample_method", "greedy") != "greedy" or getattr(spec, "rejection_sample_method", "standard") != "standard":
