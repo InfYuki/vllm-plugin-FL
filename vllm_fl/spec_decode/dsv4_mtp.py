@@ -63,6 +63,10 @@ class Dsv4MTPProposer(EagleProposer):
                                and self._fast_mtp_metadata)
         self._fused_inputs = os.getenv("MTP_FUSED_INPUTS", "1") == "1"
         self.use_local_argmax_reduction = os.getenv("MTP_LOCAL_ARGMAX", "1") == "1"
+        flag = os.getenv("MTP_OVERLAP_SECOND_PREP", "1")
+        if flag not in ("0", "1"):
+            raise ValueError("MTP_OVERLAP_SECOND_PREP must be 0 or 1")
+        self._overlap_second_prep = flag == "1"
         self._step_buffers = [
             (torch.empty(self.max_batch_size, dtype=torch.int64, device=device),
              torch.empty(self.max_batch_size, dtype=self._slot_mapping_buffer.dtype, device=device),
@@ -192,6 +196,16 @@ class Dsv4MTPProposer(EagleProposer):
         first_inputs, slot_size = self.build_model_inputs_first_pass(
             num_tokens, first_size[1], mm_embed_inputs)
 
+        # Keep K1/empty and unsupported extents on the exact old order.
+        # Both branches retain the same single packed DP coordination above.
+        if (self._overlap_second_prep and num_speculative_tokens > 1
+                and batch > 0 and batch == cad.num_reqs
+                and self._fast_mtp_metadata and self._host_metadata_active):
+            return self._propose_with_second_prep_overlap(
+                num_speculative_tokens, batch, indices, cad,
+                first_metadata, first_size, follow_size, first_inputs,
+                slot_size, num_rejected_tokens_gpu)
+
         plans = []
         if num_speculative_tokens > 1:
             follow = copy(cad)
@@ -241,6 +255,85 @@ class Dsv4MTPProposer(EagleProposer):
         output = torch.empty((batch, num_speculative_tokens), dtype=ids.dtype, device=ids.device)
         output[:, 0].copy_(ids)
         hidden = selected
+        mode, count, across = follow_size
+        for step, (positions, slots, metadata) in enumerate(plans, 1):
+            self.input_ids[:batch].copy_(ids)
+            self.positions[:batch].copy_(positions)
+            self.hidden_states[:batch].copy_(hidden)
+            with set_forward_context(
+                metadata, self.vllm_config, num_tokens=count,
+                num_tokens_across_dp=across, cudagraph_runtime_mode=mode,
+                slot_mapping=self._get_slot_mapping(count, slots)):
+                hidden = self.model(input_ids=self.input_ids[:count],
+                                    positions=self._get_positions(count),
+                                    hidden_states=self.hidden_states[:count],
+                                    inputs_embeds=None)
+            hidden = hidden[:batch]
+            ids = self._greedy_sample(hidden)
+            output[:, step].copy_(ids)
+        return output
+
+    def _propose_with_second_prep_overlap(
+            self, num_speculative_tokens, batch, indices, cad,
+            first_metadata, first_size, follow_size, first_inputs, slot_size,
+            num_rejected_tokens_gpu):
+        """Overlap follow-up host preparation with an already submitted step.
+
+        No new stream/event/context is introduced. Follow-up device writes and
+        later input/mask reuse stay ordered after first-step consumers on the
+        current stream. DSA auxiliary/shared-expert streams join that stream
+        before model return. Each follow-up fast metadata step already owns
+        its slot/SAS/RoPE and advance-position storage.
+        """
+        # Submit all first-step consumers, including its head, before the
+        # CPU consumes this proposal's accepted-count D2H event.
+        mode, count, across = first_size
+        with set_forward_context(
+            first_metadata, self.vllm_config, num_tokens=count,
+            num_tokens_across_dp=across, cudagraph_runtime_mode=mode,
+            slot_mapping=self._get_slot_mapping(slot_size, cad.slot_mapping)):
+            hidden = self.model(**first_inputs)
+        if self.model_returns_tuple():
+            raise NotImplementedError("DSv4 draft returns its single pre-HC hidden tensor")
+        selected = hidden[indices]
+        ids = self._greedy_sample(selected)
+        output = torch.empty((batch, num_speculative_tokens), dtype=ids.dtype, device=ids.device)
+        output[:, 0].copy_(ids)
+        hidden = selected
+        plans = []
+        if num_speculative_tokens > 1:
+            follow = copy(cad)
+            follow.num_actual_tokens = batch
+            follow.num_input_tokens = batch
+            follow.max_query_len = 1
+            follow.query_start_loc = self.arange[:batch + 1]
+            follow.query_start_loc_cpu = torch.from_numpy(self.token_arange_np[:batch + 1])
+            if num_rejected_tokens_gpu is not None:
+                follow.seq_lens = cad.seq_lens - num_rejected_tokens_gpu
+            positions = self.positions[indices]
+            active = None
+            for step in range(1, num_speculative_tokens):
+                # Same current-generation event and correction as the old
+                # path; the first model/head is now already submitted.
+                self._advance_host_metadata(follow, batch, self.block_size)
+                if self._fused_inputs:
+                    from .dsv4_mtp_kernels import advance_positions
+                    positions, slots, lengths, active = advance_positions(
+                        positions, follow.block_table_tensor, follow.seq_lens,
+                        self.block_size, self.max_model_len, active,
+                        self._step_buffers[step - 1])
+                else:
+                    positions, slots, lengths = advance_draft_positions(
+                        positions, follow.block_table_tensor, follow.seq_lens,
+                        self.block_size, self.max_model_len, active)
+                    active = slots >= 0
+                follow = copy(follow)
+                follow.slot_mapping = slots
+                follow.seq_lens = lengths
+                _, metadata = self.build_per_group_and_layer_attn_metadata(
+                    follow, draft_index=step, positions=positions)
+                plans.append((positions, slots, metadata))
+
         mode, count, across = follow_size
         for step, (positions, slots, metadata) in enumerate(plans, 1):
             self.input_ids[:batch].copy_(ids)

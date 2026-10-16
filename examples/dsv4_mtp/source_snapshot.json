@@ -32,7 +32,7 @@
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp.py",
       "before_sha256": null,
-      "sha256": "d0462b1d2a6cd8214ac46ce3e69b2463b4917290a83700f9f0647af00f4f0d74"
+      "sha256": "35feed671b99e429e364a47e765eb8a59b78c759b11394c7d9144a6d1d61537c"
     },
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp_utils.py",
@@ -252,5 +252,13 @@
     "scope": "plain greedy verification only; same full-vocabulary logits and torch argmax",
     "guard": "no penalties, masks, bad words, active min tokens, active logit bias, tracked thinking budget, logprobs or unknown processors",
     "validation": "AST, shell syntax, 300 simulated batches with tensor doubles, 12 guard exclusions, fallback routing and default-off static-kernel config checks passed; no actual tensors, model, NPU test or benchmark"
+  },
+  "profile_round1_optimization": {
+    "parent_commit": "2302f3679d342c8167edf07a678fdbac1754e82a",
+    "switch": "MTP_OVERLAP_SECOND_PREP=0",
+    "requested_by_default": true,
+    "scope": "Prepared eager MTP: submit first model/head before follow-up metadata preparation; same event, math and collective order",
+    "validation": "AST, shell syntax and source identity only; runtime correctness and performance pending user tests",
+    "runtime_tested": false
   }
 }
