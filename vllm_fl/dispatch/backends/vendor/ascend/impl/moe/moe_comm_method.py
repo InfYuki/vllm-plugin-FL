@@ -44,6 +44,7 @@ from vllm_fl.dispatch.backends.vendor.ascend.impl.moe.token_dispatcher import (
     TokenDispatcherWithMC2,
 )
 from .quant_type import QuantType
+from .backend_tuning import bounded_decode_capacity
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
@@ -284,7 +285,10 @@ class FusedMC2CommImpl(MoECommMethod):
 
     def __init__(self, moe_config):
         super().__init__(moe_config)
-        if get_ascend_config().enable_fused_mc2 == 1:
+        config = get_ascend_config()
+        self._fused_mc2_mode = config.enable_fused_mc2
+        self._max_output_size = config.mega_moe_max_tokens
+        if self._fused_mc2_mode == 1:
             self.expert_token_nums = torch.zeros([self.moe_config.num_local_experts], dtype=torch.int32, device="npu")
         else:
             self.expert_token_nums = None
@@ -316,7 +320,7 @@ class FusedMC2CommImpl(MoECommMethod):
             topk_ids = fused_experts_input.routing.log2phy[topk_ids]
 
         expert_tokens = None
-        if get_ascend_config().enable_fused_mc2 == 1:
+        if self._fused_mc2_mode == 1:
             assert not (
                 fused_experts_input.weights.w1_scale_bias is None or fused_experts_input.weights.w2_scale_bias is None
             ), "w1_scale_bias and w2_scale_bias cannot be None when enable_fused_mc2=1."
@@ -333,7 +337,8 @@ class FusedMC2CommImpl(MoECommMethod):
                 bias2=fused_experts_input.weights.w2_scale_bias,
                 probs=fused_experts_input.topk_weights.to(torch.float32),
                 group=self.token_dispatcher.moe_all_to_all_group_name,
-                max_output_size=get_ascend_config().mega_moe_max_tokens,
+                max_output_size=bounded_decode_capacity(
+                    fused_experts_input, self.moe_config, self._max_output_size),
                 swiglu_limit=fused_experts_input.swiglu_limit,
                 x_active_mask=fused_experts_input.routing.mc2_mask,
                 out=out,
@@ -341,7 +346,7 @@ class FusedMC2CommImpl(MoECommMethod):
             )
             expert_tokens = self.expert_token_nums
         else:
-            raise ValueError(f"Wrong value of {get_ascend_config().enable_fused_mc2=}")
+            raise ValueError(f"Wrong value of {self._fused_mc2_mode=}")
         return FusedExpertsResult(
             routed_out=out,
             expert_tokens=expert_tokens,

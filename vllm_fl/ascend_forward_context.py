@@ -279,6 +279,9 @@ def build_additional_forward_context(
         mc2_mask[actual_num_tokens:] = False
 
     return {
+        "dsv4_backend_opt": (
+            getattr(getattr(getattr(vllm_config, "model_config", None), "hf_config", None), "model_type", "") == "deepseek_v4"
+            and bool((vllm_config.additional_config or {}).get("dsv4_backend_opt", False))),
         "moe_comm_type": moe_comm_type,
         "moe_comm_method": moe_comm_method,
         "capturing": False,

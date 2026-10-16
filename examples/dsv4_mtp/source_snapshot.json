@@ -42,7 +42,7 @@
     {
       "path": "vllm_fl/attention/ascend/dsa_v1.py",
       "before_sha256": "b415ca35408b384e7fadac9186af6f99118e0a2286cb73a14a57c250124331e0",
-      "sha256": "5e9ea980d7b27c8a4576c5c44a7cf763b58420022b4b84cd92950d67a113016c"
+      "sha256": "6210af349ee175c02ad52aecb6e706d61c2f33b6132155d944eee6116739b826"
     },
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp_greedy.py",
@@ -53,6 +53,26 @@
       "path": "vllm_fl/spec_decode/dsv4_mtp_kernels.py",
       "before_sha256": null,
       "sha256": "00a72a706c1550c98d749fabb265b561b03413e1ec1a4a52ff6a22f2d9508c57"
+    },
+    {
+      "path": "vllm_fl/dispatch/backends/vendor/ascend/impl/moe/backend_tuning.py",
+      "before_sha256": null,
+      "sha256": "75883f1342d255da7571c8bba39af88e03b4dcd1d1ca661cf23f5092315d5f18"
+    },
+    {
+      "path": "vllm_fl/ascend_forward_context.py",
+      "before_sha256": "134021597aa86b19b66c5c9f85cfefdac3a543f64c8dd34192a5f0dfead1de5b",
+      "sha256": "d424cf3cdc63ac9acf622d3594b11548c11eea7f33cba2ac81e353c053c078f5"
+    },
+    {
+      "path": "vllm_fl/dispatch/backends/vendor/ascend/impl/moe/moe_comm_method.py",
+      "before_sha256": "1469b5dfc0c5190b9ee1bb2a06ef9fe9722c8c866a36b66ab7ceb60807c49c91",
+      "sha256": "d8b8fa5e0e80c49b822fe29a00f5875451d4070e08b59772597d4bdc34234723"
+    },
+    {
+      "path": "vllm_fl/dispatch/backends/vendor/ascend/impl/moe/moe_mlp.py",
+      "before_sha256": "baf73cced9a0edb384532e0d67b4c6d10935835142556bc654843fbec47b0e71",
+      "sha256": "d3997ccc82798832e02957d1b4637169d18edf1bc4ee6ad152486ed436d1dce2"
     }
   ],
   "preserved": [],
@@ -69,7 +89,7 @@
   ],
   "runtime_vllm": "ee0da84ab9e04ac7610e28580af62c365e898389",
   "reference_vllm_ascend": "412cda26814ff70c326f6eb6510f1b610f67bbc0",
-  "validation": "Batch optimization candidates added; NOT TESTED; user will validate.",
+  "validation": "Backend candidates added; NOT TESTED; user will validate.",
   "constraints": {
     "method": "mtp",
     "draft_tokens": [
@@ -130,5 +150,16 @@
     "draft_graph": "eager",
     "warmup_requests_per_performance_round": 64,
     "note": "Prepared steps require the existing fast metadata path; independent fallback switches."
+  },
+  "dsv4_backend_optimization": {
+    "tested": false,
+    "launch_default": true,
+    "override": "DSV4_BACKEND_OPT=0",
+    "attention_output_reuse": true,
+    "bounded_decode_mc2_workspace": true,
+    "shared_expert_overlap": true,
+    "compatible_w8a8_fallback_gmm_fusion": true,
+    "native_rebuild_required": false,
+    "note": "Core DSA/EP kernels already closely match Ascend; these are scoped candidates, not proven benefits."
   }
 }

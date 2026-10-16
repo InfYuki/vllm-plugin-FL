@@ -26,6 +26,9 @@ def compilation_config(variant):
 def additional_config(variant):
     if variant not in VARIANTS:
         raise ValueError(variant)
+    backend = os.getenv('DSV4_BACKEND_OPT', '1')
+    if backend not in ('0', '1'):
+        raise ValueError('DSV4_BACKEND_OPT must be 0 or 1')
     flag = os.getenv('MTP_FAST_METADATA', '1')
     if variant.startswith('mtp') and flag not in ('0', '1'):
         raise ValueError('MTP_FAST_METADATA must be 0 or 1')
@@ -35,7 +38,8 @@ def additional_config(variant):
                 enable_balance_scheduling=True,
                 ascend_compilation_config=dict(enable_npugraph_ex=True,
                                                enable_static_kernel=False),
-                enable_cpu_binding=True, multistream_overlap_shared_expert=False)
+                enable_cpu_binding=True, multistream_overlap_shared_expert=backend == '1',
+                dsv4_backend_opt=backend == '1')
 
     if variant.startswith('mtp'):
         result['dsv4_mtp_fast_metadata'] = flag == '1'

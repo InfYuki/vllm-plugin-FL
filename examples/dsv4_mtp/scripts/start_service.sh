@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 exec docker exec \
+  -e DSV4_BACKEND_OPT="${DSV4_BACKEND_OPT:-1}" \
   -e MTP_PREPARE_STEPS="${MTP_PREPARE_STEPS:-1}" \
   -e MTP_FUSED_INPUTS="${MTP_FUSED_INPUTS:-1}" \
   -e MTP_LOCAL_ARGMAX="${MTP_LOCAL_ARGMAX:-1}" \

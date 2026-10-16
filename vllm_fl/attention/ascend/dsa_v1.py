@@ -1511,6 +1511,8 @@ class AscendDSAImpl(DSAAttentionImpl):
         ascend_config = get_ascend_config()
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
         self.vllm_config = get_current_vllm_config()
+        self._reuse_dsv4_attention_output = bool(
+            (self.vllm_config.additional_config or {}).get("dsv4_backend_opt", False))
 
         # indexer param
         if self.indexer is not None:
@@ -1788,7 +1790,14 @@ class AscendDSAImpl(DSAAttentionImpl):
         prefill_hidden_states = hidden_states[decode_tokens:actual_tokens]
         decode_hidden_states = hidden_states[:decode_tokens]
 
-        o_proj_input = torch.empty(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
+        # Pure, unpadded prefill/decode can feed its attention result directly
+        # into inverse RoPE and o_proj. Mixed/padded/layout-mismatched batches
+        # retain the original contiguous staging tensor and copy behavior.
+        can_reuse = (self._reuse_dsv4_attention_output
+                     and has_prefill != has_decode
+                     and actual_tokens == o_proj_input_shape[0])
+        o_proj_input = None if can_reuse else torch.empty(
+            o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
         assert kv_cache is not None, "kv_cache tensor tuple must be provided."
         wait_for_kv_layer_from_connector(layer_name)
         if has_prefill:
@@ -1799,17 +1808,32 @@ class AscendDSAImpl(DSAAttentionImpl):
                 kv_cache,
                 attn_metadata,
             )  # type: ignore[arg-type]
-            o_proj_input[decode_tokens:actual_tokens] = output_prefill
+            if (o_proj_input is None and output_prefill.shape == o_proj_input_shape
+                    and output_prefill.dtype == hidden_states.dtype and output_prefill.is_contiguous()):
+                o_proj_input = output_prefill
+            else:
+                if o_proj_input is None:
+                    o_proj_input = torch.empty(o_proj_input_shape,
+                        dtype=hidden_states.dtype, device=hidden_states.device)
+                o_proj_input[decode_tokens:actual_tokens] = output_prefill
             cos = attn_metadata[0].prefill.cos[layer_name]
             sin = attn_metadata[0].prefill.sin[layer_name]
 
         if has_decode:
             assert attn_metadata[0].decode is not None
             output_decode = self._forward_decode(layer_name, decode_hidden_states, kv_cache, attn_metadata)
-            o_proj_input[:decode_tokens] = output_decode
+            if (o_proj_input is None and output_decode.shape == o_proj_input_shape
+                    and output_decode.dtype == hidden_states.dtype and output_decode.is_contiguous()):
+                o_proj_input = output_decode
+            else:
+                if o_proj_input is None:
+                    o_proj_input = torch.empty(o_proj_input_shape,
+                        dtype=hidden_states.dtype, device=hidden_states.device)
+                o_proj_input[:decode_tokens] = output_decode
             cos = attn_metadata[0].decode.cos[layer_name]
             sin = attn_metadata[0].decode.sin[layer_name]
 
+        assert o_proj_input is not None, "DSA metadata contains no executable segment"
         cos = attn_metadata[0].cos[layer_name]
         sin = attn_metadata[0].sin[layer_name]
 

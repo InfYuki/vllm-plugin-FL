@@ -129,6 +129,17 @@ def quant_apply_mlp(
         dynamic_eplb,
         activation,
     )
+    # Reuse Ascend's existing GMM+clipped-SwiGLU+quant operator only for
+    # the supported DSv4 symmetric W8A8 single-weight layout. The fused-MC2
+    # path and split-weight/other activation layouts retain their own route.
+    single_w1 = w1[0] if isinstance(w1, list) and len(w1) == 1 else w1
+    single_scale = not isinstance(w1_scale, list) or len(w1_scale) == 1
+    if (_EXTRA_CTX.dsv4_backend_opt and not dynamic_eplb and not use_mxfp_quant
+            and isinstance(single_w1, torch.Tensor) and single_scale
+            and single_w1.dtype == torch.int8 and act_quant_type == torch.int8
+            and w1_offset is None and act_name in ("silu", "swiglu")
+            and enable_custom_op()):
+        use_gmm_swiglu_quant_fusion = True
     # GELU can't use the fused SwiGLU+quant ops below; fall back to the
     # non-fused GMM -> GELU -> (re)quant -> GMM2 path for GELU activations.
     is_gelu_activation = activation in (MoEActivation.GELU, MoEActivation.GELU_TANH)
