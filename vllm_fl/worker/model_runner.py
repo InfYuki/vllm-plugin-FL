@@ -580,10 +580,8 @@ class ModelRunnerFL(GPUModelRunner):
             self._ascend_attn_state = None
         if self.use_compress:
             if self.speculative_config is not None:
-                raise NotImplementedError(
-                    "FL Ascend DeepSeek-V4 compressed DSA does not support "
-                    "MTP/speculative decoding yet."
-                )
+                from vllm_fl.spec_decode.dsv4_mtp_utils import validate_dsv4_mtp_config
+                validate_dsv4_mtp_config(self.vllm_config)
             from vllm_fl.dispatch.backends.vendor.ascend.dsa_compat import (
                 get_ascend_config,
             )
@@ -777,6 +775,9 @@ class ModelRunnerFL(GPUModelRunner):
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.use_compress and self.speculative_config.method == "mtp":
+                from vllm_fl.spec_decode.dsv4_mtp import Dsv4MTPProposer
+                self.drafter = Dsv4MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -797,7 +798,11 @@ class ModelRunnerFL(GPUModelRunner):
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
-            self.rejection_sampler = RejectionSampler(
+            sampler_cls = RejectionSampler
+            if self.use_compress:
+                from vllm_fl.spec_decode.dsv4_mtp import Dsv4GreedyRejectionSampler
+                sampler_cls = Dsv4GreedyRejectionSampler
+            self.rejection_sampler = sampler_cls(
                 self.sampler, self.speculative_config, self.device
             )
 
@@ -901,6 +906,11 @@ class ModelRunnerFL(GPUModelRunner):
         # DSA metadata consumes host positions while its device-side RoPE path
         # consumes ``self.positions``.  The pinned buffer is populated during
         # scheduling and never inferred back from device tensors.
+        # DSv4's host compressor planner needs actual accepted lengths. These
+        # private snapshots never replace the scheduler's optimistic counters.
+        self._dsv4_async_prev_computed_cpu: np.ndarray | None = None
+        self._dsv4_async_seq_lens_cpu: torch.Tensor | None = None
+        self._dsv4_async_computed_cpu: torch.Tensor | None = None
         self._dsa_positions_cpu_buf: torch.Tensor | None = None
         self._dsa_positions_np_buf: np.ndarray | None = None
         if self.use_compress:
@@ -1995,6 +2005,34 @@ class ModelRunnerFL(GPUModelRunner):
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             prev_positions[i] = prev_req_id_to_index.get(req_id, -1)
 
+    def _prepare_dsv4_async_host_metadata(self, num_reqs, num_scheduled_tokens):
+        if not (self.use_compress and self.use_async_spec_decode):
+            return
+        from vllm_fl.spec_decode.dsv4_mtp_utils import (
+            prepare_async_dsv4_host_metadata,
+        )
+        counts = None
+        if (self.valid_sampled_token_count_gpu is not None
+                and self.input_batch.prev_req_id_to_index):
+            # Reuse vLLM's existing acceptance-count D2H event. Do not read
+            # pending buffers or issue a device-wide synchronization.
+            counts = self._get_valid_sampled_token_count()
+            if not counts:
+                raise RuntimeError("DSv4 async MTP acceptance counts are not ready")
+        computed, lengths, positions = prepare_async_dsv4_host_metadata(
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            num_scheduled_tokens,
+            self.prev_positions.np[:num_reqs],
+            counts,
+            self.prev_num_draft_tokens.np,
+            self._dsv4_async_prev_computed_cpu,
+        )
+        self._dsv4_async_prev_computed_cpu = computed.copy()
+        self._dsv4_async_computed_cpu = torch.from_numpy(computed)
+        self._dsv4_async_seq_lens_cpu = torch.from_numpy(lengths)
+        assert self._dsa_positions_np_buf is not None
+        np.copyto(self._dsa_positions_np_buf[:len(positions)], positions)
+
     def _prepare_input_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2356,6 +2394,7 @@ class ModelRunnerFL(GPUModelRunner):
         # Used for gathering from previous iteration's GPU tensors.
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
         self._compute_prev_positions(num_reqs)
+        self._prepare_dsv4_async_host_metadata(num_reqs, num_scheduled_tokens)
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -2739,6 +2778,17 @@ class ModelRunnerFL(GPUModelRunner):
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
+            if self.use_compress and num_scheduled_tokens is not None:
+                # Real target batches only. Capture/idle dummy calls must keep
+                # their independent sentinel metadata and never consume these.
+                assert self._dsv4_async_seq_lens_cpu is not None
+                assert self._dsv4_async_computed_cpu is not None
+                seq_lens_cpu = torch.zeros(num_reqs_padded, dtype=torch.int32)
+                num_computed_tokens_cpu = torch.zeros_like(seq_lens_cpu)
+                seq_lens_cpu[:num_reqs].copy_(self._dsv4_async_seq_lens_cpu[:num_reqs])
+                num_computed_tokens_cpu[:num_reqs].copy_(
+                    self._dsv4_async_computed_cpu[:num_reqs])
+
         # Compute mm_prefix bidirectional ranges before building
         # attention metadata so builders handle them during build().
         # Ranges exceeding sliding_window are skipped to prevent
@@ -2808,6 +2858,9 @@ class ModelRunnerFL(GPUModelRunner):
             if self.use_compress:
                 assert self._dsa_positions_cpu_buf is not None
                 cm_base.positions_cpu = self._dsa_positions_cpu_buf
+                if self.use_async_spec_decode and num_scheduled_tokens is not None:
+                    cm_base.seq_lens_cpu = seq_lens_cpu
+                    cm_base.num_computed_tokens_cpu = num_computed_tokens_cpu
         self._set_ascend_common_attention_state(cm_base, ascend_attn_state)
 
         if self.dcp_world_size > 1:

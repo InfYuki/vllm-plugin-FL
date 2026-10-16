@@ -1,0 +1,120 @@
+{
+  "experiment": "dsv4_mtp_infyuki_20261015",
+  "repo": "/workspace/vllm-plugin-FL-InfYuki",
+  "model": "/public-flash/models/DeepSeek-V4-Flash-w8a8-mtp/",
+  "commit": "61ae2938e02cd3f843425139e9ef5dfe1cdd0a9f",
+  "changed": [
+    {
+      "path": "vllm_fl/worker/model_runner.py",
+      "before_sha256": "c5119fce3ee0165b454a67957e7a495ab98acb8499b5d4a3d0a87d0d328c1671",
+      "sha256": "2ea7f925d03b11ea3b7e05564ebfb374e1827d145018bb5254841b7c583cf493"
+    },
+    {
+      "path": "vllm_fl/dispatch/backends/vendor/ascend/patches/patch_deepseek_v4.py",
+      "before_sha256": "caa8fb85b6e4bbac4ccf830e1a7535847636d0c6811b36112ee925cb2c8587a8",
+      "sha256": "1e7fb875f97d28c48e56341cc6e4ad585f2270ebf65df03abd2cc4001e4c904c"
+    },
+    {
+      "path": "vllm_fl/kv_cache/ascend/deepseek_v4_kv_cache.py",
+      "before_sha256": "fa7f3b16c8f5cc49eaa3737e50f40454faf6f02e142a1f2794d3430c6ccd7a4e",
+      "sha256": "d4d031b5b73af698bff943bccaf2a951cfecef3c1611362cd2941a8d16b1fbf5"
+    },
+    {
+      "path": "vllm_fl/models/deepseek_v4_mtp.py",
+      "before_sha256": null,
+      "sha256": "f5b5618f7bdd459a896fdb5f830dda7e22018fdd66baf7385095322a82365ce7"
+    },
+    {
+      "path": "vllm_fl/spec_decode/__init__.py",
+      "before_sha256": null,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "vllm_fl/spec_decode/dsv4_mtp.py",
+      "before_sha256": null,
+      "sha256": "4313247ccc359ede4a62750047b3f1ae753ec3db3f24e7aca92588b58a121e17"
+    },
+    {
+      "path": "vllm_fl/spec_decode/dsv4_mtp_utils.py",
+      "before_sha256": null,
+      "sha256": "150b9287ec5dd2a24cc9c71f98b51d70a94ebe2559add74d26e737a30a766fa0"
+    },
+    {
+      "path": "vllm_fl/attention/ascend/dsa_v1.py",
+      "before_sha256": "b415ca35408b384e7fadac9186af6f99118e0a2286cb73a14a57c250124331e0",
+      "sha256": "5e9ea980d7b27c8a4576c5c44a7cf763b58420022b4b84cd92950d67a113016c"
+    },
+    {
+      "path": "vllm_fl/spec_decode/dsv4_mtp_greedy.py",
+      "before_sha256": null,
+      "sha256": "d409c6cfdc2718270249df748879910f83e62ebb6a61d33cf775206f33a00d00"
+    }
+  ],
+  "preserved": [],
+  "patch_flags": [
+    "FL_DSV4_CPU_PREFILL_BOUNDS",
+    "FL_DSV4_FUSED_MC2_ADAPTIVE_CAPACITY",
+    "FL_DSV4_SKIP_UNUSED_MTP_STASH",
+    "FL_DSV4_HC_RESIDUAL_ALIAS",
+    "FL_DSV4_FUSED_SHARED_OVERLAP",
+    "FL_DSV4_LARGE_BATCH_ALLTOALL",
+    "FL_DSV4_DEFER_PROLOG_JOIN",
+    "FL_DSV4_SHARE_PROLOG_QUANT",
+    "FL_DSV4_EARLY_INDEXER_WEIGHTS"
+  ],
+  "runtime_vllm": "ee0da84ab9e04ac7610e28580af62c365e898389",
+  "reference_vllm_ascend": "412cda26814ff70c326f6eb6510f1b610f67bbc0",
+  "validation": "Fused greedy candidate is UNTESTED per user request; previous checks cover the previous layer only",
+  "constraints": {
+    "method": "mtp",
+    "draft_tokens": [
+      1,
+      2,
+      3
+    ],
+    "sampling": "greedy",
+    "async_scheduling": true,
+    "draft_eager": true,
+    "sync_fallback": true
+  },
+  "async_metadata": "Private actual-length CPU snapshots, mirrored from vLLM acceptance-count event and previous-row mapping; no scheduler counter mutation",
+  "mtp_performance_fix": {
+    "host_metadata": "Private CPU mirrors; at most one existing acceptance-count event per multi-step proposal",
+    "draft_graph": "eager (unchanged)",
+    "mtp2_capture_sizes": [
+      12,
+      24,
+      36,
+      48,
+      60,
+      72,
+      84,
+      96,
+      108,
+      120,
+      132,
+      144,
+      156,
+      168,
+      180,
+      192
+    ],
+    "target_baseline": "unchanged"
+  },
+  "mtp_metadata_optimization": {
+    "default": "enabled for mtp variants only",
+    "override": "MTP_FAST_METADATA=0",
+    "scope": "Real SWA follow-up single-query draft steps; first/profile/prefill paths unchanged",
+    "draft_graph": "eager",
+    "lcm_backport": "compatibility tested but not deployed; explicit capture sizes already aligned",
+    "explicit_mtp2_capture_sizes": "unchanged: 12..192 step12"
+  },
+  "validation_before_greedy_fusion": "153 CPU/static checks passed; this optimization was not tested by assistant with NPU inference",
+  "mtp_greedy_fusion": {
+    "default": "enabled for Ascend DSv4 MTP",
+    "override": "MTP_FUSED_GREEDY=0",
+    "tested": false,
+    "scope": "Greedy prefix verification/output only; existing GPU cumulative draft counts",
+    "unchanged": "Logits processors, vocabulary argmax, bonus sampling, proposer, graph and scheduling"
+  }
+}

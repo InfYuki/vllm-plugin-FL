@@ -243,3 +243,8 @@ If you want to use the original CUDA operators, you can set the following enviro
 ```sh
 export USE_FLAGGEMS=0
 ```
+
+
+## DSv4 Flash MTP experimental handoff
+
+DSv4 Flash on Ascend: [详细工作交接与迁移说明](docs/dsv4_mtp/HANDOFF_zh.md) and [launch / AISBench workspace templates](examples/dsv4_mtp/README.md). The latest fused greedy verification candidate is deployed in the source snapshot but remains untested; see the validation matrix before use.
