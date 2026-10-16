@@ -27,3 +27,8 @@ bash aisbench/test_performance.sh mtp2
 ```
 
 以上命令由用户自行执行；切换组别先停止自己启动的服务。`MTP_FUSED_GREEDY=0` 关闭本轮融合候选，`MTP_FAST_METADATA=0` 关闭上一轮后续SWA元数据快路径，两者是独立开关。源码初始快照由 source_snapshot.json 固定，不要为了绕过身份检查随意改 SHA。
+
+
+## Current merged-draft candidate (2026-10-16)
+
+See `../../docs/dsv4_mtp/MERGED_DRAFT_20261016_zh.md`. Defaults: MTP_MERGED_GRAPH=1, MTP_DIRECT_INPUTS=1, MTP_TARGET_ARGMAX=1, DSV4_BACKEND_OPT=0. Dedicated SWA decode graph ownership is separate from generic draft enforce_eager. No runtime validation was performed for this revision.

@@ -17,7 +17,8 @@ def mtp_sequence_partition(value, rank, world_size, pad_size):
 def validate_dsv4_mtp_config(config):
     spec = config.speculative_config
     import os
-    for name in ("MTP_PREPARE_STEPS", "MTP_FUSED_INPUTS", "MTP_LOCAL_ARGMAX"):
+    for name in ("MTP_PREPARE_STEPS", "MTP_FUSED_INPUTS", "MTP_LOCAL_ARGMAX",
+                 "MTP_DIRECT_INPUTS", "MTP_MERGED_GRAPH"):
         if os.getenv(name, "1") not in ("0", "1"):
             raise ValueError(name + " must be 0 or 1")
     if not (config.additional_config or {}).get("enable_dsv4_mtp", False):

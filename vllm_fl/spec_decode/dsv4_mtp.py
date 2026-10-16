@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DSv4-only eager MTP proposer and exact greedy verifier for FL Ascend."""
+"""DSv4-only MTP proposer and exact greedy verifier for FL Ascend."""
 import os
 from copy import copy
 from dataclasses import fields, replace
@@ -7,7 +7,7 @@ from dataclasses import fields, replace
 import torch
 import numpy as np
 from vllm.config import CUDAGraphMode
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -33,6 +33,13 @@ class Dsv4MTPProposer(EagleProposer):
                                and self._fast_mtp_metadata)
         self._fused_inputs = os.getenv("MTP_FUSED_INPUTS", "1") == "1"
         self.use_local_argmax_reduction = os.getenv("MTP_LOCAL_ARGMAX", "1") == "1"
+        self._direct_inputs = os.getenv("MTP_DIRECT_INPUTS", "1") == "1"
+        self._merged_graph_enabled = (os.getenv("MTP_MERGED_GRAPH", "1") == "1"
+                                      and self._direct_inputs and self._prepare_steps
+                                      and os.getenv("GRAPH", "1") != "0")
+        from .dsv4_mtp_graph import MergedDraftGraph
+        self._merged_graph = MergedDraftGraph()
+        self._draft_graph_key = None
         self._step_buffers = [
             (torch.empty(self.max_batch_size, dtype=torch.int64, device=device),
              torch.empty(self.max_batch_size, dtype=self._slot_mapping_buffer.dtype, device=device),
@@ -119,24 +126,36 @@ class Dsv4MTPProposer(EagleProposer):
             self._host_metadata_active = False
             self._pending_draft_counts = None
 
-    def _coordinate_step_sizes(self, first_tokens, follow_tokens):
+    def _coordinate_step_sizes(self, first_tokens, follow_tokens, graph_eligible=False):
         """One eager DP collective carrying both forward extents.
 
         dummy_run uses the same layout/order so idle DP ranks participate.
-        Graph and microbatch modes stay disabled for this draft-only path.
+        The third row collectively admits the separate merged draft graph.
+        Generic vLLM draft graph dispatch and microbatching stay disabled.
         """
         parallel = self.vllm_config.parallel_config
+        self._draft_graph_key = None
+        graph_eligible = bool(graph_eligible and self._merged_graph_enabled
+                              and first_tokens > 0 and follow_tokens > 0)
         if parallel.data_parallel_size == 1:
+            if graph_eligible:
+                self._draft_graph_key = (first_tokens, follow_tokens, self.num_speculative_tokens)
             return ((CUDAGraphMode.NONE, first_tokens, None),
                     (CUDAGraphMode.NONE, follow_tokens, None))
         from vllm.v1.worker.dp_utils import _get_device_and_group
         import torch.distributed as dist
         device, group = _get_device_and_group(parallel)
-        sizes = torch.zeros((2, parallel.data_parallel_size), dtype=torch.int32)
-        sizes[:, parallel.data_parallel_rank] = torch.tensor([first_tokens, follow_tokens])
+        sizes = torch.zeros((3, parallel.data_parallel_size), dtype=torch.int32)
+        sizes[:, parallel.data_parallel_rank] = torch.tensor([first_tokens, follow_tokens, int(graph_eligible)])
         packed = sizes.to(device, non_blocking=True)
         dist.all_reduce(packed, group=group)
         sizes = packed.cpu()
+        # All ranks must capture/replay together. Require equal exact extents;
+        # mixed/prefill/idle or unequal DP batches collectively fall back to eager.
+        if (bool(torch.all(sizes[2] == 1))
+                and bool(torch.all(sizes[0] == first_tokens))
+                and bool(torch.all(sizes[1] == follow_tokens))):
+            self._draft_graph_key = (first_tokens, follow_tokens, self.num_speculative_tokens)
         return ((CUDAGraphMode.NONE, first_tokens, sizes[0]),
                 (CUDAGraphMode.NONE, follow_tokens, sizes[1]))
 
@@ -158,7 +177,10 @@ class Dsv4MTPProposer(EagleProposer):
             target_hidden_states, token_indices_to_sample,
             common_attn_metadata, num_rejected_tokens_gpu)
         _, first_metadata = self.build_per_group_and_layer_attn_metadata(cad)
-        first_size, follow_size = self._coordinate_step_sizes(num_tokens, batch)
+        pure_decode = bool(first_metadata) and all(
+            metadata.num_prefills == 0 and metadata.num_decode_tokens == num_tokens
+            for metadata in first_metadata.values())
+        first_size, follow_size = self._coordinate_step_sizes(num_tokens, batch, pure_decode)
         first_inputs, slot_size = self.build_model_inputs_first_pass(
             num_tokens, first_size[1], mm_embed_inputs)
 
@@ -196,6 +218,10 @@ class Dsv4MTPProposer(EagleProposer):
                     follow, draft_index=step, positions=positions)
                 plans.append((positions, slots, metadata))
 
+        if self._direct_inputs:
+            return self._run_direct_steps(first_inputs, indices, cad, first_metadata, plans,
+                                          first_size, follow_size)
+
         # Input/position/hidden buffers for step zero have not been overwritten
         # by metadata preparation. Each later step owns its metadata storage.
         mode, count, across = first_size
@@ -228,6 +254,34 @@ class Dsv4MTPProposer(EagleProposer):
             ids = self._greedy_sample(hidden)
             output[:, step].copy_(ids)
         return output
+
+    def _run_direct_steps(self, first_inputs, indices, cad, first_metadata, plans,
+                          first_size, follow_size):
+        from .dsv4_mtp_graph import run_merged_draft
+        # Build context objects before the first forward. Subsequent steps pass
+        # ids/positions/hidden directly; eager execution does not need address copies.
+        contexts = []
+        metadata_steps = [(first_metadata, cad.slot_mapping, first_size)]
+        metadata_steps.extend((metadata, slots, follow_size) for _, slots, metadata in plans)
+        for metadata, slots, (_, count, across) in metadata_steps:
+            with set_forward_context(
+                    metadata, self.vllm_config, num_tokens=count,
+                    num_tokens_across_dp=across, cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    slot_mapping=dict.fromkeys(self._draft_attn_layer_names, slots)):
+                ctx = get_forward_context()
+                ctx.additional_kwargs["is_draft_model"] = True
+                ctx.additional_kwargs["is_draft_model_prefill"] = any(
+                    item.num_prefills > 0 for item in metadata.values())
+                # The platform uses one global mask buffer. Each step needs its
+                # own contents when all contexts are prepared ahead of forwards.
+                mask = ctx.additional_kwargs.get("mc2_mask")
+                if mask is not None:
+                    ctx.additional_kwargs["mc2_mask"] = mask.clone()
+                contexts.append(ctx)
+        inputs = (first_inputs, indices.to(torch.int64), [positions for positions, _, _ in plans])
+        return self._merged_graph.run(
+            self._draft_graph_key, lambda values, ctxs: run_merged_draft(self, values, ctxs),
+            inputs, contexts)
 
     def prepare_next_token_ids_padded(self, sampled_token_ids, requests,
                                       gpu_input_batch, discard_request_mask):
@@ -359,8 +413,10 @@ class Dsv4MTPProposer(EagleProposer):
                 raise NotImplementedError("DSv4 MTP requires FL DSA SWA-only draft attention")
             fast_decode = (
                 getattr(self, "_fast_mtp_metadata", False) and self._host_metadata_active
-                and draft_index > 0 and cad.max_query_len == 1
-                and cad.num_actual_tokens == cad.num_reqs and cad.num_reqs > 0
+                and 0 <= draft_index < self.num_speculative_tokens
+                and 1 <= cad.max_query_len <= builder.decode_threshold
+                and bool(torch.all(queries > 0)) and cad.num_reqs > 0
+                and (draft_index == 0 or cad.num_actual_tokens == cad.num_reqs)
                 and cad.graph_pad_size == -1)
             if fast_decode:
                 metadata = builder.build_for_dsv4_mtp_decode(cad, draft_index)
@@ -382,17 +438,47 @@ class Dsv4GreedyRejectionSampler(RejectionSampler):
         if flag not in ("0", "1"):
             raise ValueError("MTP_FUSED_GREEDY must be 0 or 1")
         self._fused_greedy = flag == "1"
+        flag = os.getenv("MTP_TARGET_ARGMAX", "1")
+        if flag not in ("0", "1"):
+            raise ValueError("MTP_TARGET_ARGMAX must be 0 or 1")
+        self._target_argmax = flag == "1"
+
+    @staticmethod
+    def _plain_greedy(sampling):
+        from vllm.v1.sample.logits_processor.builtin import (
+            LogitBiasLogitsProcessor, MinTokensLogitsProcessor)
+        if (not sampling.no_penalties or sampling.allowed_token_ids_mask is not None
+                or sampling.bad_words_token_ids or sampling.logprob_token_ids
+                or sampling.thinking_budget_state_holder is not None):
+            return False
+        # Exact builtin types only. Unknown/custom processors retain the sampler.
+        for processor in sampling.logitsprocs.non_argmax_invariant:
+            if type(processor) is MinTokensLogitsProcessor and not processor.min_toks:
+                continue
+            if type(processor) is LogitBiasLogitsProcessor and not processor.biases:
+                continue
+            return False
+        return True
 
     def forward(self, metadata, draft_probs, logits, sampling_metadata):
         if not sampling_metadata.all_greedy or sampling_metadata.max_num_logprobs is not None:
             raise NotImplementedError("DSv4 MTP requires temperature=0 and no logprobs")
-        bonus = self.sampler(
-            logits=logits[metadata.bonus_logits_indices],
-            sampling_metadata=replace(sampling_metadata, max_num_logprobs=None),
-            predict_bonus_token=True).sampled_token_ids
-        target = self.apply_logits_processors(
-            logits[metadata.target_logits_indices].float(), sampling_metadata, metadata)
-        target_argmax = target.argmax(-1)
+        if (self._target_argmax and logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and self._plain_greedy(sampling_metadata)):
+            # Reduce vocabulary before selecting rows. Avoid two vocabulary-wide
+            # advanced-index copies and the draft-row float32 conversion.
+            # Widening fp16/bf16 to fp32 cannot change this argmax/tie ordering.
+            all_ids = logits.argmax(-1)
+            bonus = all_ids[metadata.bonus_logits_indices].unsqueeze(-1)
+            target_argmax = all_ids[metadata.target_logits_indices]
+        else:
+            bonus = self.sampler(
+                logits=logits[metadata.bonus_logits_indices],
+                sampling_metadata=replace(sampling_metadata, max_num_logprobs=None),
+                predict_bonus_token=True).sampled_token_ids
+            target = self.apply_logits_processors(
+                logits[metadata.target_logits_indices].float(), sampling_metadata, metadata)
+            target_argmax = target.argmax(-1)
         if self._fused_greedy and logits.device.type in ("npu", "privateuseone"):
             from vllm.triton_utils import HAS_TRITON
             if not HAS_TRITON:

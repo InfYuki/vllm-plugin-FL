@@ -26,7 +26,7 @@ def compilation_config(variant):
 def additional_config(variant):
     if variant not in VARIANTS:
         raise ValueError(variant)
-    backend = os.getenv('DSV4_BACKEND_OPT', '1')
+    backend = os.getenv('DSV4_BACKEND_OPT', '0')
     if backend not in ('0', '1'):
         raise ValueError('DSV4_BACKEND_OPT must be 0 or 1')
     flag = os.getenv('MTP_FAST_METADATA', '1')
