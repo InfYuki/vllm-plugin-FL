@@ -8,6 +8,10 @@ import torch
 import numpy as np
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import set_forward_context
+from vllm.logger import init_logger
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor, MinTokensLogitsProcessor,
+)
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -16,6 +20,32 @@ from .dsv4_mtp_utils import (
     advance_draft_positions, greedy_rejection_tokens, padded_draft_indices,
     resolve_next_tokens, validate_dsv4_mtp_config,
 )
+
+
+logger = init_logger(__name__)
+
+
+def _plain_greedy_sampling(metadata):
+    """Host-only guard: bypass no stateful or argmax-changing processing."""
+    if (not metadata.all_greedy or metadata.all_random
+            or metadata.max_num_logprobs is not None
+            or metadata.logprob_token_ids
+            or not metadata.no_penalties
+            or metadata.allowed_token_ids_mask is not None
+            or metadata.bad_words_token_ids):
+        return False
+    holder = metadata.thinking_budget_state_holder
+    if holder is not None and holder.has_tracked_requests():
+        return False
+    for processor in metadata.logitsprocs.non_argmax_invariant:
+        # Builtins are present even when inactive. Unknown implementations and
+        # subclasses stay on the original path, including their side effects.
+        if type(processor) is MinTokensLogitsProcessor and not processor.min_toks:
+            continue
+        if type(processor) is LogitBiasLogitsProcessor and not processor.biases:
+            continue
+        return False
+    return True
 
 
 class Dsv4MTPProposer(EagleProposer):
@@ -382,17 +412,35 @@ class Dsv4GreedyRejectionSampler(RejectionSampler):
         if flag not in ("0", "1"):
             raise ValueError("MTP_FUSED_GREEDY must be 0 or 1")
         self._fused_greedy = flag == "1"
+        flag = os.getenv("MTP_VERIFY_ARGMAX", "1")
+        if flag not in ("0", "1"):
+            raise ValueError("MTP_VERIFY_ARGMAX must be 0 or 1")
+        self._verify_argmax = flag == "1"
 
     def forward(self, metadata, draft_probs, logits, sampling_metadata):
         if not sampling_metadata.all_greedy or sampling_metadata.max_num_logprobs is not None:
             raise NotImplementedError("DSv4 MTP requires temperature=0 and no logprobs")
-        bonus = self.sampler(
-            logits=logits[metadata.bonus_logits_indices],
-            sampling_metadata=replace(sampling_metadata, max_num_logprobs=None),
-            predict_bonus_token=True).sampled_token_ids
-        target = self.apply_logits_processors(
-            logits[metadata.target_logits_indices].float(), sampling_metadata, metadata)
-        target_argmax = target.argmax(-1)
+        if (self._verify_argmax
+                and logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and _plain_greedy_sampling(sampling_metadata)):
+            # Argmax commutes with row selection. FP16/BF16 values are exactly
+            # representable in FP32, so the original conversion cannot change
+            # their ordering. Keep the same torch argmax and first-index ties.
+            token_ids = logits.argmax(dim=-1)
+            target_argmax = token_ids[metadata.target_logits_indices]
+            bonus = token_ids[metadata.bonus_logits_indices].to(torch.int32).unsqueeze(-1)
+            logger.info_once(
+                "DSv4 MTP verification uses shared argmax before row selection.",
+                scope="global",
+            )
+        else:
+            bonus = self.sampler(
+                logits=logits[metadata.bonus_logits_indices],
+                sampling_metadata=replace(sampling_metadata, max_num_logprobs=None),
+                predict_bonus_token=True).sampled_token_ids
+            target = self.apply_logits_processors(
+                logits[metadata.target_logits_indices].float(), sampling_metadata, metadata)
+            target_argmax = target.argmax(-1)
         if self._fused_greedy and logits.device.type in ("npu", "privateuseone"):
             from vllm.triton_utils import HAS_TRITON
             if not HAS_TRITON:

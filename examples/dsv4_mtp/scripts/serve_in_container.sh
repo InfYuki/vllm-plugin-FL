@@ -102,7 +102,9 @@ fi
 ASYNC_SCHEDULING=$(python "$HERE/launch_config.py" async "$VARIANT" "${ASYNC_SCHEDULING:-auto}")
 SCHED_ARGS=(--no-async-scheduling)
 if [[ "$ASYNC_SCHEDULING" == 1 ]]; then SCHED_ARGS=(--async-scheduling); fi
-export STATIC_KERNEL="${STATIC_KERNEL:-1}"
+export STATIC_KERNEL="${STATIC_KERNEL:-0}"
+export MTP_VERIFY_ARGMAX="${MTP_VERIFY_ARGMAX:-1}"
+[[ "$MTP_VERIFY_ARGMAX" == 0 || "$MTP_VERIFY_ARGMAX" == 1 ]] || exit 2
 ADDITIONAL_CONFIG=$(python "$HERE/launch_config.py" additional "$VARIANT")
 python "$HERE/check_source.py"
 export MTP_FUSED_GREEDY="${MTP_FUSED_GREEDY:-1}"
@@ -152,9 +154,10 @@ path.write_text(json.dumps(record))
 record.update(variant=sys.argv[3],port=int(sys.argv[4]),graph=int(sys.argv[5]),experiment='dsv4_mtp_infyuki_20261015',timestamp=time.time(),manifest_sha256=hashlib.sha256((path.parents[2]/'manifest.json').read_bytes()).hexdigest())
 record.update(
  recovery='mtp2_3 withdrawn; prior prepared eager path',
- optimization='static_kernel_20261016',
- static_kernel_requested=os.getenv('STATIC_KERNEL','1')=='1',
- enable_static_kernel=os.getenv('STATIC_KERNEL','1')=='1' and sys.argv[5]=='1',
+ optimization='verify_argmax_20261016',
+ dsv4_mtp_verify_argmax=sys.argv[3].startswith('mtp') and os.getenv('MTP_VERIFY_ARGMAX','1')=='1',
+ static_kernel_requested=os.getenv('STATIC_KERNEL','0')=='1',
+ enable_static_kernel=os.getenv('STATIC_KERNEL','0')=='1' and sys.argv[5]=='1',
  dsv4_backend_opt=os.getenv('DSV4_BACKEND_OPT','0')=='1',
  dsv4_mtp_prepared_steps=sys.argv[3].startswith('mtp') and os.getenv('MTP_PREPARE_STEPS','1')=='1' and os.getenv('MTP_FAST_METADATA','1')=='1',
  dsv4_mtp_fused_inputs=sys.argv[3].startswith('mtp') and os.getenv('MTP_FUSED_INPUTS','1')=='1',

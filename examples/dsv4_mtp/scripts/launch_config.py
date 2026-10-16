@@ -26,7 +26,7 @@ def compilation_config(variant):
 def additional_config(variant):
     if variant not in VARIANTS:
         raise ValueError(variant)
-    static_kernel = os.getenv('STATIC_KERNEL', '1')
+    static_kernel = os.getenv('STATIC_KERNEL', '0')
     if static_kernel not in ('0', '1'):
         raise ValueError('STATIC_KERNEL must be 0 or 1')
     graph = os.getenv('GRAPH', '1')

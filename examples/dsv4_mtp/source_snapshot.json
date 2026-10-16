@@ -32,7 +32,7 @@
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp.py",
       "before_sha256": null,
-      "sha256": "33c9285f7afd7cf26d0b7ffe38f3ce11113e3cfe55e8fea4b8d5eb242725d1cc"
+      "sha256": "d0462b1d2a6cd8214ac46ce3e69b2463b4917290a83700f9f0647af00f4f0d74"
     },
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp_utils.py",
@@ -109,7 +109,7 @@
   ],
   "runtime_vllm": "ee0da84ab9e04ac7610e28580af62c365e898389",
   "reference_vllm_ascend": "412cda26814ff70c326f6eb6510f1b610f67bbc0",
-  "validation": "Static cached-logger regression reproduced the startup TypeError before fix; fixed version passed isolated configuration, syntax and hash checks. No service, device runtime or benchmark executed.",
+  "validation": "Verify-argmax candidate: stdlib-only structural and simulated dataflow checks passed. STATIC_KERNEL defaults off. User device/runtime test pending.",
   "constraints": {
     "method": "mtp",
     "draft_tokens": [
@@ -205,6 +205,18 @@
       3275.52,
       7367.94,
       7341.24
+    ],
+    "mtp2_4": [
+      3378.99,
+      3588.73,
+      7387.6,
+      7415.89
+    ],
+    "mtp2_3": [
+      3292.21,
+      3417.72,
+      7303.91,
+      7326.19
     ]
   },
   "mtp3_recovery": {
@@ -218,7 +230,7 @@
   "static_kernel_optimization": {
     "parent_commit": "a7419bee46e62cf02dfb8652c2e76c00e8bea5cc",
     "reference_commit": "412cda26814ff70c326f6eb6510f1b610f67bbc0",
-    "requested_by_default": true,
+    "requested_by_default": false,
     "switch": "STATIC_KERNEL=0",
     "scope": "target npugraph_ex decode static kernels; eager MTP unchanged",
     "validation": "static checks passed; precision/performance and actual kernel selection unverified",
@@ -229,6 +241,16 @@
       "root_cause": "info_once cache received unhashable list; other Gloo errors are secondary",
       "fix": "tuple only for logging; compiler range remains list",
       "validation": "stdlib cached-logger regression reproduced before fix and passed after fix; no runtime startup or benchmark"
-    }
+    },
+    "cache_status": "not implemented: method-level persistent cache incompatible with current segmented FX backend without further integration; saved FX code alone does not establish static-package reuse",
+    "default_off_reason": "16 static compilation rounds and about 30 minute startup; user requested disabling until reliable reuse is available"
+  },
+  "verify_argmax_optimization": {
+    "parent_commit": "6d560ea8e1be9f53586a5bd404714907b3e7bd32",
+    "switch": "MTP_VERIFY_ARGMAX=0",
+    "requested_by_default": true,
+    "scope": "plain greedy verification only; same full-vocabulary logits and torch argmax",
+    "guard": "no penalties, masks, bad words, active min tokens, active logit bias, tracked thinking budget, logprobs or unknown processors",
+    "validation": "AST, shell syntax, 300 simulated batches with tensor doubles, 12 guard exclusions, fallback routing and default-off static-kernel config checks passed; no actual tensors, model, NPU test or benchmark"
   }
 }
