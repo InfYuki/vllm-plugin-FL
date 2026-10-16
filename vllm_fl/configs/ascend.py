@@ -285,9 +285,9 @@ def get_ascend_config():
         "MC2 hierarchy communication",
     )
     _reject_unsupported(eplb_requested, "EPLB")
-    _reject_unsupported(
-        bool(compilation.get("enable_static_kernel", False)), "static kernel generation"
-    )
+    if (compilation.get("enable_static_kernel", False)
+            and not compilation.get("enable_npugraph_ex", True)):
+        raise ValueError("enable_static_kernel requires enable_npugraph_ex=True")
     _reject_unsupported(
         bool(fusion.get("fusion_ops_gmmswigluquant", False)),
         "gmmswigluquant fusion",
@@ -376,7 +376,7 @@ def get_ascend_config():
         ),
         ascend_compilation_config=SimpleNamespace(
             enable_npugraph_ex=compilation.get("enable_npugraph_ex", True),
-            enable_static_kernel=False,
+            enable_static_kernel=compilation.get("enable_static_kernel", False),
             fuse_norm_quant=compilation.get("fuse_norm_quant", True),
             fuse_qknorm_rope=compilation.get("fuse_qknorm_rope", True),
             fuse_allreduce_rms=compilation.get("fuse_allreduce_rms", False),

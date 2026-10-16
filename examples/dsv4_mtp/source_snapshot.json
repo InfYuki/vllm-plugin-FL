@@ -73,6 +73,26 @@
       "path": "vllm_fl/dispatch/backends/vendor/ascend/impl/moe/moe_mlp.py",
       "before_sha256": "baf73cced9a0edb384532e0d67b4c6d10935835142556bc654843fbec47b0e71",
       "sha256": "d3997ccc82798832e02957d1b4637169d18edf1bc4ee6ad152486ed436d1dce2"
+    },
+    {
+      "path": "vllm_fl/compilation/compiler_interface.py",
+      "before_sha256": "78733f640b9a8e186a9b633aad68ea8a034d0a7d32570c6af2ce42c8129c539e",
+      "sha256": "b0d703269d21ba29138b44e6a0f2dd4f432732c6300638090c8b1bde8959a76d"
+    },
+    {
+      "path": "vllm_fl/worker/worker.py",
+      "before_sha256": "878224ef39912452249e08a7b1d326c3c7effb0b04193a0ce6875fb35c3fd924",
+      "sha256": "cadd1574d20e8bfcad4487b89828650695c982744dcc872e8a87d0add4f36325"
+    },
+    {
+      "path": "vllm_fl/configs/ascend.py",
+      "before_sha256": "4e0f57e1cc35a0ba3cfac756aca508dff20430cd65b6f314151a4736b9a40459",
+      "sha256": "83bef1c6d5ba38213a1d5b4e5af262f316299e1aec66ce78fa2075d34c4b5921"
+    },
+    {
+      "path": "vllm_fl/dispatch/backends/vendor/ascend/impl/moe/fused_moe.py",
+      "before_sha256": "c356d959e382cf46c9d270a57c93f5c87e49caf38810474b45e447a68ae3dbe6",
+      "sha256": "3f17010e06db863588d04dd456e962b2d6975ec7c008867b9b23303a75825c1b"
     }
   ],
   "preserved": [],
@@ -89,7 +109,7 @@
   ],
   "runtime_vllm": "ee0da84ab9e04ac7610e28580af62c365e898389",
   "reference_vllm_ascend": "412cda26814ff70c326f6eb6510f1b610f67bbc0",
-  "validation": "Recovery: restored four execution files byte-for-byte from fcb43e9; backend opt remains off; static checks only, user runtime retest pending.",
+  "validation": "Static-kernel candidate: AST, bash syntax, isolated configuration/topology/rollback checks and source hashes passed; no device imports, service actions, inference or benchmarks.",
   "constraints": {
     "method": "mtp",
     "draft_tokens": [
@@ -194,5 +214,15 @@
     "merged_capture_messages": 0,
     "runtime_tested": false,
     "benchmark_abort_on_failure": true
+  },
+  "static_kernel_optimization": {
+    "parent_commit": "a7419bee46e62cf02dfb8652c2e76c00e8bea5cc",
+    "reference_commit": "412cda26814ff70c326f6eb6510f1b610f67bbc0",
+    "requested_by_default": true,
+    "switch": "STATIC_KERNEL=0",
+    "scope": "target npugraph_ex decode static kernels; eager MTP unchanged",
+    "validation": "static checks passed; precision/performance and actual kernel selection unverified",
+    "gmm_fusion": "deferred: native binding absent; backend opt remains disabled",
+    "moe_layer_index": "existing wrap guard connected to static kernel flag, matching upstream"
   }
 }

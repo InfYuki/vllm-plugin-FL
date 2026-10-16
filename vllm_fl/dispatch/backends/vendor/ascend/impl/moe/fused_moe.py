@@ -406,7 +406,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         ):
             raise NotImplementedError("FL Ascend rc1 MoE EPLB is not migrated")
 
-        self.enable_npugraph_ex_static_kernel = False
+        self.enable_npugraph_ex_static_kernel = (
+            ascend_config.ascend_compilation_config.enable_static_kernel
+        )
 
         vllm_config = get_current_vllm_config()
 

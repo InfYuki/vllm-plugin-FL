@@ -1,3 +1,6 @@
+# Static-kernel integration adapted from vllm-ascend 412cda26814ff70c326f6eb6510f1b610f67bbc0.
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 BAAI. All rights reserved.
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.19.0/vllm/v1/worker/gpu_worker.py
 # Below is the original copyright:
@@ -159,6 +162,25 @@ class WorkerFL(WorkerBase):
             )
 
             init_ascend_config(vllm_config)
+            from vllm_fl.compilation.compiler_interface import AscendCompilerOptions
+
+            options = AscendCompilerOptions.from_vllm_config(vllm_config)
+            options.validate_supported()
+            if options.enable_npugraph_ex and options.enable_static_kernel:
+                # Match the upstream worker's static-package cleanup on shutdown.
+                import signal
+
+                shutdown_requested = False
+
+                def cleanup_static_kernel(signum, frame):
+                    nonlocal shutdown_requested
+                    if not shutdown_requested:
+                        shutdown_requested = True
+                        self.uninstall_static_kernel()
+                        raise SystemExit()
+
+                signal.signal(signal.SIGTERM, cleanup_static_kernel)
+                signal.signal(signal.SIGINT, cleanup_static_kernel)
 
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
@@ -298,6 +320,38 @@ class WorkerFL(WorkerBase):
                 f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
                 f"utilization or reduce GPU memory used by other processes."
             )
+
+    def uninstall_static_kernel(self):
+        import fcntl
+        import os
+        import subprocess
+
+        ascend_home_path = os.environ["ASCEND_HOME_PATH"]
+        static_kernel_dir_path = os.path.join(ascend_home_path, "opp/static_kernel")
+        uninstall_script_path = os.path.join(static_kernel_dir_path, "ai_core/uninstall.sh")
+        lock_file_path = os.path.join(static_kernel_dir_path, "uninstall.lock")
+
+        if not os.path.exists(uninstall_script_path):
+            return
+        with open(lock_file_path, "w") as lock_fd:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                subprocess.Popen(
+                    ["bash", uninstall_script_path],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except (BlockingIOError, OSError):
+                return
+            finally:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    if os.path.exists(lock_file_path):
+                        os.remove(lock_file_path)
+                except Exception:
+                    return
 
     def init_device(self):
         # Iluvatar: patch sampler ops to disable torch.compile (flagtree triton

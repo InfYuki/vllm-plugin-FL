@@ -1,3 +1,6 @@
+# Static-kernel integration adapted from vllm-ascend 412cda26814ff70c326f6eb6510f1b610f67bbc0.
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 BAAI. All rights reserved.
 
 """Ascend graph compiler integration owned by the FL plugin.
@@ -12,6 +15,7 @@ from __future__ import annotations
 import copy
 import functools
 import json
+import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from hashlib import sha256
@@ -66,25 +70,51 @@ class AscendCompilerOptions:
         return cls(**values)
 
     def validate_supported(self) -> None:
-        if self.enable_static_kernel:
-            raise NotImplementedError(
-                "FL AscendCompiler does not yet support enable_static_kernel=True"
-            )
+        if self.enable_static_kernel and not self.enable_npugraph_ex:
+            raise ValueError("enable_static_kernel requires enable_npugraph_ex=True")
 
 
-def _configure_npugraph_ex(config: Any, process_kwargs_options: Callable) -> None:
+def _configure_npugraph_ex(
+    config: Any,
+    process_kwargs_options: Callable,
+    compiler_options: AscendCompilerOptions,
+    vllm_config: VllmConfig,
+) -> None:
     options: dict[str, Any] = {
         "force_eager": True,
         "inplace_pass": False,
         "clone_input": False,
         "clone_output": False,
     }
+    if compiler_options.enable_static_kernel:
+        # Match vLLM-Ascend 412cda2: coordinate every local TP/DP worker.
+        parallel = vllm_config.parallel_config
+        local_world_size = parallel.local_world_size * parallel.data_parallel_size_local
+        if "LOCAL_WORLD_SIZE" not in os.environ:
+            os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
+        if int(os.environ["LOCAL_WORLD_SIZE"]) != local_world_size:
+            raise ValueError("LOCAL_WORLD_SIZE conflicts with local TP/DP topology")
+        spec = vllm_config.speculative_config
+        query_len = spec.num_speculative_tokens + 1 if spec else 1
+        max_tokens = vllm_config.scheduler_config.max_num_seqs * query_len
+        sizes = [n for n in vllm_config.compilation_config.cudagraph_capture_sizes
+                 if query_len <= n <= max_tokens]
+        if not sizes:
+            raise ValueError("Static kernel requires decode cudagraph capture sizes")
+        options["static_kernel_compile"] = True
+        options["_vllm_aclnn_static_kernel_sym_range"] = sizes
+        logger.info_once(
+            "FL static kernel enabled: LOCAL_WORLD_SIZE=%d, decode sizes=%s",
+            local_world_size, sizes, scope="global",
+        )
     process_kwargs_options(config, {"options": options})
 
 
 def _compile_with_npugraph_ex(
     graph: fx.GraphModule,
     example_inputs: list[Any],
+    compiler_options: AscendCompilerOptions,
+    vllm_config: VllmConfig,
 ) -> Callable[..., Any]:
     try:
         import torch_npu  # noqa: F401
@@ -117,7 +147,7 @@ def _compile_with_npugraph_ex(
 
     torch.npu.set_compile_mode(jit_compile=False)
     config = nge.CompilerConfig()
-    _configure_npugraph_ex(config, _process_kwargs_options)
+    _configure_npugraph_ex(config, _process_kwargs_options, compiler_options, vllm_config)
     backend = nge.get_npu_backend(compiler_config=config)
 
     if not graph_returns_tuple(graph):
@@ -243,7 +273,9 @@ class AscendCompiler(CompilerInterface):
             logger.info_once(
                 "FL AscendCompiler is compiling with npugraph_ex.", scope="global"
             )
-            compiled = _compile_with_npugraph_ex(graph, example_inputs)
+            compiled = _compile_with_npugraph_ex(
+                graph, example_inputs, options, self.vllm_config
+            )
         else:
             logger.info_once(
                 "FL AscendCompiler is compiling with Ascend fusion passes only.",

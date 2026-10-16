@@ -26,6 +26,12 @@ def compilation_config(variant):
 def additional_config(variant):
     if variant not in VARIANTS:
         raise ValueError(variant)
+    static_kernel = os.getenv('STATIC_KERNEL', '1')
+    if static_kernel not in ('0', '1'):
+        raise ValueError('STATIC_KERNEL must be 0 or 1')
+    graph = os.getenv('GRAPH', '1')
+    if graph not in ('0', '1'):
+        raise ValueError('GRAPH must be 0 or 1')
     backend = os.getenv('DSV4_BACKEND_OPT', '0')
     if backend not in ('0', '1'):
         raise ValueError('DSV4_BACKEND_OPT must be 0 or 1')
@@ -37,7 +43,7 @@ def additional_config(variant):
                 enable_shared_expert_dp=True, enable_mlapo=True,
                 enable_balance_scheduling=True,
                 ascend_compilation_config=dict(enable_npugraph_ex=True,
-                                               enable_static_kernel=False),
+                                               enable_static_kernel=static_kernel == '1' and graph == '1'),
                 enable_cpu_binding=True, multistream_overlap_shared_expert=backend == '1',
                 dsv4_backend_opt=backend == '1')
 

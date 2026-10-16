@@ -91,7 +91,7 @@ if [[ "$VARIANT" != baseline ]]; then
  SPEC_ARGS=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$K,\"enforce_eager\":true,\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"standard\"}")
 fi
 COMPILE_CONFIG=null
-GRAPH=${GRAPH:-1}
+export GRAPH=${GRAPH:-1}
 [[ "$GRAPH" == 0 || "$GRAPH" == 1 ]] || exit 2
 if [[ "$GRAPH" == 0 ]]; then
  COMPILE_ARGS=(--enforce-eager)
@@ -102,6 +102,7 @@ fi
 ASYNC_SCHEDULING=$(python "$HERE/launch_config.py" async "$VARIANT" "${ASYNC_SCHEDULING:-auto}")
 SCHED_ARGS=(--no-async-scheduling)
 if [[ "$ASYNC_SCHEDULING" == 1 ]]; then SCHED_ARGS=(--async-scheduling); fi
+export STATIC_KERNEL="${STATIC_KERNEL:-1}"
 ADDITIONAL_CONFIG=$(python "$HERE/launch_config.py" additional "$VARIANT")
 python "$HERE/check_source.py"
 export MTP_FUSED_GREEDY="${MTP_FUSED_GREEDY:-1}"
@@ -151,6 +152,9 @@ path.write_text(json.dumps(record))
 record.update(variant=sys.argv[3],port=int(sys.argv[4]),graph=int(sys.argv[5]),experiment='dsv4_mtp_infyuki_20261015',timestamp=time.time(),manifest_sha256=hashlib.sha256((path.parents[2]/'manifest.json').read_bytes()).hexdigest())
 record.update(
  recovery='mtp2_3 withdrawn; prior prepared eager path',
+ optimization='static_kernel_20261016',
+ static_kernel_requested=os.getenv('STATIC_KERNEL','1')=='1',
+ enable_static_kernel=os.getenv('STATIC_KERNEL','1')=='1' and sys.argv[5]=='1',
  dsv4_backend_opt=os.getenv('DSV4_BACKEND_OPT','0')=='1',
  dsv4_mtp_prepared_steps=sys.argv[3].startswith('mtp') and os.getenv('MTP_PREPARE_STEPS','1')=='1' and os.getenv('MTP_FAST_METADATA','1')=='1',
  dsv4_mtp_fused_inputs=sys.argv[3].startswith('mtp') and os.getenv('MTP_FUSED_INPUTS','1')=='1',
