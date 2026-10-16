@@ -150,9 +150,7 @@ path=pathlib.Path(sys.argv[2]); record={'pid':pid,'starttime':stamp}
 path.write_text(json.dumps(record))
 record.update(variant=sys.argv[3],port=int(sys.argv[4]),graph=int(sys.argv[5]),experiment='dsv4_mtp_infyuki_20261015',timestamp=time.time(),manifest_sha256=hashlib.sha256((path.parents[2]/'manifest.json').read_bytes()).hexdigest())
 record.update(
- dsv4_mtp_target_argmax=sys.argv[3].startswith('mtp') and os.getenv('MTP_TARGET_ARGMAX','1')=='1',
- dsv4_mtp_direct_inputs=sys.argv[3].startswith('mtp') and os.getenv('MTP_DIRECT_INPUTS','1')=='1',
- dsv4_mtp_merged_graph_requested=sys.argv[3].startswith('mtp') and os.getenv('MTP_MERGED_GRAPH','1')=='1',
+ recovery='mtp2_3 withdrawn; prior prepared eager path',
  dsv4_backend_opt=os.getenv('DSV4_BACKEND_OPT','0')=='1',
  dsv4_mtp_prepared_steps=sys.argv[3].startswith('mtp') and os.getenv('MTP_PREPARE_STEPS','1')=='1' and os.getenv('MTP_FAST_METADATA','1')=='1',
  dsv4_mtp_fused_inputs=sys.argv[3].startswith('mtp') and os.getenv('MTP_FUSED_INPUTS','1')=='1',

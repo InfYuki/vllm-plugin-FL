@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 exec docker exec \
-  -e MTP_TARGET_ARGMAX="${MTP_TARGET_ARGMAX:-1}" \
-  -e MTP_DIRECT_INPUTS="${MTP_DIRECT_INPUTS:-1}" \
-  -e MTP_MERGED_GRAPH="${MTP_MERGED_GRAPH:-1}" \
   -e DSV4_BACKEND_OPT="${DSV4_BACKEND_OPT:-0}" \
   -e MTP_PREPARE_STEPS="${MTP_PREPARE_STEPS:-1}" \
   -e MTP_FUSED_INPUTS="${MTP_FUSED_INPUTS:-1}" \

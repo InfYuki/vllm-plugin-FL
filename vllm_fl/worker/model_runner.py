@@ -808,7 +808,6 @@ class ModelRunnerFL(GPUModelRunner):
 
         self.num_spec_tokens = 0
         self.prev_num_spec_tokens = 0
-        self._dsv4_valid_count_snapshot = None
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
@@ -5807,7 +5806,6 @@ class ModelRunnerFL(GPUModelRunner):
     ) -> None:
         if self.valid_sampled_token_count_event is None:
             return
-        self._dsv4_valid_count_snapshot = None
 
         default_stream = current_platform.torch_device_fn.current_stream()
         # Initialize a new stream to overlap the copy operation with
@@ -5834,13 +5832,8 @@ class ModelRunnerFL(GPUModelRunner):
 
         counts_cpu = self.valid_sampled_token_count_cpu
         assert counts_cpu is not None
-        if self.use_compress and self._dsv4_valid_count_snapshot is not None:
-            return self._dsv4_valid_count_snapshot
         sampled_count_event.synchronize()
-        counts = counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
-        if self.use_compress:
-            self._dsv4_valid_count_snapshot = counts
-        return counts
+        return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
     def _get_spec_decode_draft_probs(
         self, spec_decode_metadata: SpecDecodeMetadata

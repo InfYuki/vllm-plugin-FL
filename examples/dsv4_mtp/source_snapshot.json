@@ -7,7 +7,7 @@
     {
       "path": "vllm_fl/worker/model_runner.py",
       "before_sha256": "c5119fce3ee0165b454a67957e7a495ab98acb8499b5d4a3d0a87d0d328c1671",
-      "sha256": "cc7d2109a5b478c321dd1dc04213b56975144f21d54d46e4143766e86cd1d1a9"
+      "sha256": "2ea7f925d03b11ea3b7e05564ebfb374e1827d145018bb5254841b7c583cf493"
     },
     {
       "path": "vllm_fl/dispatch/backends/vendor/ascend/patches/patch_deepseek_v4.py",
@@ -32,17 +32,17 @@
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp.py",
       "before_sha256": null,
-      "sha256": "20851de7409033db8fc6932c9e63c08e17e2fe31f509841289097ddee926ec15"
+      "sha256": "33c9285f7afd7cf26d0b7ffe38f3ce11113e3cfe55e8fea4b8d5eb242725d1cc"
     },
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp_utils.py",
       "before_sha256": null,
-      "sha256": "5a682e4a4815f723b6aacc1f751cdfa814c80e358f1d7edac3b1bc0969080bc7"
+      "sha256": "b1b4b6993913ddaa5f2d06eb1039ea1115b75f7933b2fd31f71982e3041115db"
     },
     {
       "path": "vllm_fl/attention/ascend/dsa_v1.py",
       "before_sha256": "b415ca35408b384e7fadac9186af6f99118e0a2286cb73a14a57c250124331e0",
-      "sha256": "1eaac4a864e288ea080ac3e6d45dafabe837dad829798cc7896701afd323c910"
+      "sha256": "6210af349ee175c02ad52aecb6e706d61c2f33b6132155d944eee6116739b826"
     },
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp_greedy.py",
@@ -73,11 +73,6 @@
       "path": "vllm_fl/dispatch/backends/vendor/ascend/impl/moe/moe_mlp.py",
       "before_sha256": "baf73cced9a0edb384532e0d67b4c6d10935835142556bc654843fbec47b0e71",
       "sha256": "d3997ccc82798832e02957d1b4637169d18edf1bc4ee6ad152486ed436d1dce2"
-    },
-    {
-      "path": "vllm_fl/spec_decode/dsv4_mtp_graph.py",
-      "before_sha256": null,
-      "sha256": "252a81f63ef5f3086996e7b8c047c227978659d3ca09ac49eeb2bd4254a1eb39"
     }
   ],
   "preserved": [],
@@ -94,7 +89,7 @@
   ],
   "runtime_vllm": "ee0da84ab9e04ac7610e28580af62c365e898389",
   "reference_vllm_ascend": "412cda26814ff70c326f6eb6510f1b610f67bbc0",
-  "validation": "Merged-draft revision: static syntax/diff/identity checks only; runtime correctness and throughput pending user testing.",
+  "validation": "Recovery: restored four execution files byte-for-byte from fcb43e9; backend opt remains off; static checks only, user runtime retest pending.",
   "constraints": {
     "method": "mtp",
     "draft_tokens": [
@@ -152,7 +147,7 @@
     "prepare_steps_default": true,
     "fused_inputs_default": true,
     "draft_local_argmax_default": true,
-    "draft_graph": "Dedicated FL merged SWA decode graph for DP-uniform exact shapes; generic draft stays eager",
+    "draft_graph": "eager; merged candidate withdrawn after user-reported device fault",
     "warmup_requests_per_performance_round": 64,
     "note": "Prepared steps require the existing fast metadata path; independent fallback switches."
   },
@@ -168,16 +163,9 @@
     "note": "Retained as opt-in: user mtp2_2 results show no consistent benefit versus mtp2_1."
   },
   "mtp_merged_draft_optimization": {
-    "tested": false,
-    "merged_graph_default": true,
-    "direct_inputs_default": true,
-    "target_argmax_default": true,
-    "first_decode_metadata": true,
-    "acceptance_cpu_snapshot": true,
-    "max_graphs": 4,
-    "graph_scope": "All DP ranks pure decode with identical first/follow extents; otherwise eager",
-    "fallback": "MTP_MERGED_GRAPH=0",
-    "native_rebuild_required": false
+    "enabled": false,
+    "withdrawn_commit": "865f007fbbde34242e7b53b99d9291b89860d33b",
+    "reason": "Device fault MoeGatingTopKHash, 507011; exact candidate causality unresolved; restore prior execution source"
   },
   "reported_performance_total_tok_s": {
     "mtp2_0": [
@@ -198,5 +186,13 @@
       7367.94,
       7341.24
     ]
+  },
+  "mtp3_recovery": {
+    "failed_experiment": "20261016-185307-1478040",
+    "device_fault_kernel": "MoeGatingTopKHash",
+    "device_error": 507011,
+    "merged_capture_messages": 0,
+    "runtime_tested": false,
+    "benchmark_abort_on_failure": true
   }
 }
