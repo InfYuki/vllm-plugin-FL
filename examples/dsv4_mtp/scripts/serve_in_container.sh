@@ -104,6 +104,8 @@ SCHED_ARGS=(--no-async-scheduling)
 if [[ "$ASYNC_SCHEDULING" == 1 ]]; then SCHED_ARGS=(--async-scheduling); fi
 export STATIC_KERNEL="${STATIC_KERNEL:-0}"
 export MTP_VERIFY_ARGMAX="${MTP_VERIFY_ARGMAX:-1}"
+export MTP_COUNT_LIST_CACHE="${MTP_COUNT_LIST_CACHE:-1}"
+[[ "$MTP_COUNT_LIST_CACHE" == 0 || "$MTP_COUNT_LIST_CACHE" == 1 ]] || exit 2
 export MTP_DIRECT_DRAFT_HIDDEN="${MTP_DIRECT_DRAFT_HIDDEN:-1}"
 [[ "$MTP_DIRECT_DRAFT_HIDDEN" == 0 || "$MTP_DIRECT_DRAFT_HIDDEN" == 1 ]] || exit 2
 export MTP_OVERLAP_SECOND_PREP="${MTP_OVERLAP_SECOND_PREP:-1}"
@@ -158,7 +160,8 @@ path.write_text(json.dumps(record))
 record.update(variant=sys.argv[3],port=int(sys.argv[4]),graph=int(sys.argv[5]),experiment='dsv4_mtp_infyuki_20261015',timestamp=time.time(),manifest_sha256=hashlib.sha256((path.parents[2]/'manifest.json').read_bytes()).hexdigest())
 record.update(
  recovery='mtp2_3 withdrawn; prior prepared eager path',
- optimization='profile_round2_direct_hidden_20261019',
+ optimization='profile_round3_count_cache_20261019',
+ dsv4_mtp_count_list_cache_requested=sys.argv[3].startswith('mtp') and os.getenv('MTP_COUNT_LIST_CACHE','1')=='1',
  dsv4_mtp_direct_draft_hidden_requested=sys.argv[3].startswith('mtp') and os.getenv('MTP_DIRECT_DRAFT_HIDDEN','1')=='1',
  dsv4_mtp_overlap_second_prep_requested=sys.argv[3].startswith('mtp') and os.getenv('MTP_OVERLAP_SECOND_PREP','1')=='1',
  dsv4_mtp_verify_argmax=sys.argv[3].startswith('mtp') and os.getenv('MTP_VERIFY_ARGMAX','1')=='1',

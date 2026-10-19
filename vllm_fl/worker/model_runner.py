@@ -1137,6 +1137,20 @@ class ModelRunnerFL(GPUModelRunner):
                     pin_memory=self.pin_memory,
                 )
 
+        # Cache only completed DSv4 async-MTP count snapshots. Other models
+        # retain the original getter, including its fresh-list return contract.
+        self._mtp_count_list_cache_enabled = False
+        if (self.use_compress and self.use_async_spec_decode
+                and getattr(self.speculative_config, "method", None) == "mtp"
+                and (self.vllm_config.additional_config or {}).get("enable_dsv4_mtp", False)):
+            import os
+            flag = os.getenv("MTP_COUNT_LIST_CACHE", "1")
+            if flag not in ("0", "1"):
+                raise ValueError("MTP_COUNT_LIST_CACHE must be 0 or 1")
+            self._mtp_count_list_cache_enabled = flag == "1"
+        self._mtp_count_list_generation = 0
+        self._mtp_count_list_snapshot = None
+
         # Model weight offloader
         # Make sure this is called before any get_offloader call
         set_offloader(create_offloader(self.offload_config))
@@ -5804,6 +5818,11 @@ class ModelRunnerFL(GPUModelRunner):
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
     ) -> None:
+        if self._mtp_count_list_cache_enabled:
+            # Invalidate before any copy/record, including the no-event case.
+            # Re-recording the same event object starts a new generation.
+            self._mtp_count_list_generation += 1
+            self._mtp_count_list_snapshot = None
         if self.valid_sampled_token_count_event is None:
             return
 
@@ -5824,6 +5843,8 @@ class ModelRunnerFL(GPUModelRunner):
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def _get_valid_sampled_token_count(self) -> list[int]:
+        if self._mtp_count_list_cache_enabled:
+            return self._get_mtp_count_list_snapshot()
         # Wait until valid_sampled_tokens_count is copied to cpu,
         prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
         sampled_count_event = self.valid_sampled_token_count_event
@@ -5834,6 +5855,34 @@ class ModelRunnerFL(GPUModelRunner):
         assert counts_cpu is not None
         sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
+
+    def _get_mtp_count_list_snapshot(self) -> list[int]:
+        """Reuse a completed count generation, without sharing a mutable list."""
+        prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
+        sampled_count_event = self.valid_sampled_token_count_event
+        if sampled_count_event is None or prev_sampled_token_ids is None:
+            self._mtp_count_list_snapshot = None
+            return []
+
+        counts_cpu = self.valid_sampled_token_count_cpu
+        assert counts_cpu is not None
+        rows = prev_sampled_token_ids.shape[0]
+        generation = self._mtp_count_list_generation
+        snapshot = self._mtp_count_list_snapshot
+        if (snapshot is not None and snapshot[0] == generation
+                and snapshot[1] is sampled_count_event
+                and snapshot[2] is counts_cpu
+                and snapshot[3] is prev_sampled_token_ids
+                and snapshot[4] == rows):
+            return snapshot[5].copy()
+
+        # The first read of this generation still waits for its own D2H.
+        sampled_count_event.synchronize()
+        counts = counts_cpu[:rows].tolist()
+        self._mtp_count_list_snapshot = (
+            generation, sampled_count_event, counts_cpu,
+            prev_sampled_token_ids, rows, counts)
+        return counts.copy()
 
     def _get_spec_decode_draft_probs(
         self, spec_decode_metadata: SpecDecodeMetadata
