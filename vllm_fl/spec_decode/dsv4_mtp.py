@@ -67,6 +67,10 @@ class Dsv4MTPProposer(EagleProposer):
         if flag not in ("0", "1"):
             raise ValueError("MTP_OVERLAP_SECOND_PREP must be 0 or 1")
         self._overlap_second_prep = flag == "1"
+        flag = os.getenv("MTP_DIRECT_DRAFT_HIDDEN", "1")
+        if flag not in ("0", "1"):
+            raise ValueError("MTP_DIRECT_DRAFT_HIDDEN must be 0 or 1")
+        self._direct_draft_hidden = flag == "1"
         self._step_buffers = [
             (torch.empty(self.max_batch_size, dtype=torch.int64, device=device),
              torch.empty(self.max_batch_size, dtype=self._slot_mapping_buffer.dtype, device=device),
@@ -338,14 +342,32 @@ class Dsv4MTPProposer(EagleProposer):
         for step, (positions, slots, metadata) in enumerate(plans, 1):
             self.input_ids[:batch].copy_(ids)
             self.positions[:batch].copy_(positions)
-            self.hidden_states[:batch].copy_(hidden)
+            # Only bypass the hidden copy for the exact unpadded layout.
+            # Inspect metadata only: no device read, conversion or allocation.
+            direct_hidden = (
+                self._direct_draft_hidden and count == batch
+                and hidden.ndim == 2 and self.hidden_states.ndim == 2
+                and hidden.shape[0] == count
+                and count <= self.hidden_states.shape[0]
+                and hidden.shape[1] == self.hidden_states.shape[1]
+                and hidden.dtype == self.hidden_states.dtype
+                and hidden.device == self.hidden_states.device
+                and hidden.is_contiguous()
+                and self.hidden_states.is_contiguous()
+            )
+            if direct_hidden:
+                draft_hidden = hidden
+            else:
+                # Preserve the old tail/padding contents when count != batch.
+                self.hidden_states[:batch].copy_(hidden)
+                draft_hidden = self.hidden_states[:count]
             with set_forward_context(
                 metadata, self.vllm_config, num_tokens=count,
                 num_tokens_across_dp=across, cudagraph_runtime_mode=mode,
                 slot_mapping=self._get_slot_mapping(count, slots)):
                 hidden = self.model(input_ids=self.input_ids[:count],
                                     positions=self._get_positions(count),
-                                    hidden_states=self.hidden_states[:count],
+                                    hidden_states=draft_hidden,
                                     inputs_embeds=None)
             hidden = hidden[:batch]
             ids = self._greedy_sample(hidden)

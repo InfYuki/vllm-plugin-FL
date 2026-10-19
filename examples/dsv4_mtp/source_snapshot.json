@@ -32,7 +32,7 @@
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp.py",
       "before_sha256": null,
-      "sha256": "35feed671b99e429e364a47e765eb8a59b78c759b11394c7d9144a6d1d61537c"
+      "sha256": "5f82dc8cca3b3bc14793b119507ae9b8c6ab2bcaa5469faba132688cfc4d91d8"
     },
     {
       "path": "vllm_fl/spec_decode/dsv4_mtp_utils.py",
@@ -258,6 +258,14 @@
     "switch": "MTP_OVERLAP_SECOND_PREP=0",
     "requested_by_default": true,
     "scope": "Prepared eager MTP: submit first model/head before follow-up metadata preparation; same event, math and collective order",
+    "validation": "AST, shell syntax and source identity only; runtime correctness and performance pending user tests",
+    "runtime_tested": false
+  },
+  "profile_round2_optimization": {
+    "parent_commit": "541a8080cdca7113b849167daca79ddaa6891560",
+    "switch": "MTP_DIRECT_DRAFT_HIDDEN=0",
+    "requested_by_default": true,
+    "scope": "Prepared overlap eager MTP: avoid follow-up hidden copy only when guarded tensor layout matches; original copy fallback retained",
     "validation": "AST, shell syntax and source identity only; runtime correctness and performance pending user tests",
     "runtime_tested": false
   }
