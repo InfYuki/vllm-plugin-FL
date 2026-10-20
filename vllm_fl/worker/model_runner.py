@@ -3572,28 +3572,19 @@ class ModelRunnerFL(
         self,
         query_start_loc: CpuGpuBuffer,
         num_tokens_padded: int,
-        num_reqs_padded: int,
         num_reqs: int,
-        cudagraph_runtime_mode: CUDAGraphMode | None = None,
         batch_desc_num_reqs: int | None = None,
     ) -> int:
-        """Make FIA query starts end at the TP/graph-padded token count."""
-        if (
-            cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
-        ):
-            num_reqs_padded = num_reqs
-        else:
-            num_reqs_padded = (
-                batch_desc_num_reqs
-                if batch_desc_num_reqs is not None
-                else num_reqs
-            )
+        """Pad FIA query starts for FULL_DECODE_ONLY decode/capture batches."""
+        num_reqs_padded = (
+            batch_desc_num_reqs
+            if batch_desc_num_reqs is not None
+            else num_reqs
+        )
 
         if (
             num_tokens_padded
             == num_reqs_padded * self.uniform_decode_query_len
-            and self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL
         ):
             assert num_reqs <= num_reqs_padded
             last_loc = query_start_loc.np[num_reqs]
@@ -4476,8 +4467,8 @@ class ModelRunnerFL(
 
             if self.use_ascend_attention and cudagraph_mode == CUDAGraphMode.FULL:
                 num_reqs_padded = self._pad_query_start_loc_for_fia(
-                    self.query_start_loc, num_tokens_padded, num_reqs_padded,
-                    num_reqs, cudagraph_mode, batch_desc.num_reqs,
+                    self.query_start_loc, num_tokens_padded,
+                    num_reqs, batch_desc.num_reqs,
                 )
             self._run_common_attention_metadata(num_reqs_padded, cudagraph_mode)
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
@@ -6123,8 +6114,8 @@ class ModelRunnerFL(
                     and cudagraph_runtime_mode == CUDAGraphMode.FULL
                 ):
                     num_reqs_padded = self._pad_query_start_loc_for_fia(
-                        self.query_start_loc, num_tokens_padded, num_reqs_padded,
-                        num_reqs, cudagraph_runtime_mode, batch_desc.num_reqs,
+                        self.query_start_loc, num_tokens_padded,
+                        num_reqs, batch_desc.num_reqs,
                     )
 
                 # Sync block table CPU->GPU so cleared rows from

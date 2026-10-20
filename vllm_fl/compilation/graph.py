@@ -132,13 +132,7 @@ class GraphWrapper:
         self.vllm_config = vllm_config
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
-        self.graph_runtime = None
-        if current_platform.device_type == "npu":
-            from vllm_fl.compilation.graph_runtime import GraphRuntimeController
-
-            self.graph_runtime = graph_runtime or GraphRuntimeController(
-                vllm_config=vllm_config
-            )
+        self.graph_runtime = graph_runtime
         # Eager MCCL collectives produce new tensor addresses on every call.
         # Copy only TP PIECEWISE segment inputs into their capture-time buffers;
         # enabling vLLM's full-model copy wrapper would clone dynamic views and
