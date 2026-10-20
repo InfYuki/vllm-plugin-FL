@@ -8,7 +8,7 @@ import dataclasses
 import weakref
 from collections import Counter
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from typing import Any, ClassVar
 from unittest.mock import patch
 
@@ -126,11 +126,19 @@ class GraphWrapper:
                  runnable: Callable,
                  vllm_config: VllmConfig,
                  runtime_mode: CUDAGraphMode,
-                 cudagraph_options: GraphOptions | None = None):
+                 cudagraph_options: GraphOptions | None = None,
+                 graph_runtime: Any | None = None):
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
+        self.graph_runtime = None
+        if current_platform.device_type == "npu":
+            from vllm_fl.compilation.graph_runtime import GraphRuntimeController
+
+            self.graph_runtime = graph_runtime or GraphRuntimeController(
+                vllm_config=vllm_config
+            )
         # Eager MCCL collectives produce new tensor addresses on every call.
         # Copy only TP PIECEWISE segment inputs into their capture-time buffers;
         # enabling vLLM's full-model copy wrapper would clone dynamic views and
@@ -236,32 +244,38 @@ class GraphWrapper:
                               lambda: None)
                     )
 
-            if self.graph_pool is not None:
-                set_graph_pool_id(self.graph_pool)
-            else:
-                set_graph_pool_id(current_platform.graph_pool_handle())
+                if self.graph_pool is not None:
+                    set_graph_pool_id(self.graph_pool)
+                else:
+                    set_graph_pool_id(current_platform.graph_pool_handle())
 
-            # Sync offloader's copy stream before capture if available.
-            try:
-                from vllm.model_executor.offloader.base import get_offloader
-                get_offloader().sync_prev_onload()
-            except (ImportError, RuntimeError):
-                pass
-
-            # FL-specific: use platform-agnostic graph capture
-            with current_platform.torch_device_fn.graph(
-                graph, pool=self.graph_pool
-            ):
-                # `output` is managed by pytorch's cudagraph pool
-                output = self.runnable(*args, **kwargs)
-                # Join offloader's copy stream after forward if available
+                # Sync offloader's copy stream before capture if available.
                 try:
                     from vllm.model_executor.offloader.base import get_offloader
-                    get_offloader().join_after_forward()
+                    get_offloader().sync_prev_onload()
                 except (ImportError, RuntimeError):
+                    # Offloader hooks are optional across FL runtime builds.
                     pass
-                if self.cudagraph_options.weak_ref_output:
-                    output = weak_ref_tensors(output)
+
+                # FL-specific: use platform-agnostic graph capture
+                capture_scope = (
+                    self.graph_runtime.capture_scope(forward_context)
+                    if self.graph_runtime is not None else nullcontext()
+                )
+                with capture_scope, current_platform.torch_device_fn.graph(
+                    graph, pool=self.graph_pool
+                ):
+                    # `output` is managed by pytorch's cudagraph pool
+                    output = self.runnable(*args, **kwargs)
+                    # Join offloader's copy stream after forward if available
+                    try:
+                        from vllm.model_executor.offloader.base import get_offloader
+                        get_offloader().join_after_forward()
+                    except (ImportError, RuntimeError):
+                        # Keep the existing path without optional offloader hooks.
+                        pass
+                    if self.cudagraph_options.weak_ref_output:
+                        output = weak_ref_tensors(output)
 
             entry.output = weak_ref_tensors(output)
             entry.graph = graph
@@ -292,7 +306,9 @@ class GraphWrapper:
         except (ImportError, RuntimeError):
             pass
 
-        if current_platform.device_type == "npu":
-            current_platform.torch_device_fn.synchronize()
-        entry.graph.replay()
+        if self.graph_runtime is not None:
+            with self.graph_runtime.replay_scope(forward_context):
+                entry.graph.replay()
+        else:
+            entry.graph.replay()
         return entry.output
