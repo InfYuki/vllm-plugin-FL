@@ -118,12 +118,17 @@ def _init_vendor_device():
     """Apply compatibility hooks that must run before vLLM model imports."""
     from vllm_fl.utils import DeviceInfo
 
-    if DeviceInfo().vendor_name == "kunlunxin":
+    vendor_name = DeviceInfo().vendor_name
+    if vendor_name == "kunlunxin":
         from vllm_fl.dispatch.backends.vendor.kunlunxin.patches.patch_fla_utils import (
             _patch_xpu_get_device,
         )
 
         _patch_xpu_get_device()
+    elif vendor_name in {"metax", "maca"}:
+        from vllm_fl.patches.flaggems_vllm_metax import prepare_flaggems_vllm_metax
+
+        prepare_flaggems_vllm_metax()
 
 
 def register():
@@ -197,8 +202,8 @@ def _patch_ascend_torch_accelerator() -> None:
     from vllm.platforms import current_platform
 
     if (
-        current_platform.vendor_name == "ascend"
-        and current_platform.device_type == "npu"
+        current_platform.device_type == "npu"
+        and getattr(current_platform, "vendor_name", None) == "ascend"
     ):
         from vllm_fl.dispatch.backends.vendor.ascend.patches.patch_torch_accelerator import (
             patch_torch_accelerator,
@@ -251,6 +256,10 @@ def register_model():
 
         install_arm_cpu_packed_w4a8()
         return
+
+    from vllm_fl.models.hy4.registration import register_hy_v4_support
+
+    register_hy_v4_support()
 
     _register_flagcx_connector()
 

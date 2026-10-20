@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+import logging
 
 import torch
 from vllm_fl.platforms.ascend.hardware import (
@@ -10,8 +10,10 @@ from vllm_fl.platforms.ascend.hardware import (
     get_ascend_device_type as get_ascend_device_type,
 )
 
+logger = logging.getLogger(__name__)
+
+
 ACL_FORMAT_FRACTAL_NZ = 29
-_SHARED_EXPERTS_CALCULATION_STREAM = None
 
 from vllm_fl.configs.ascend import (
     _nested_config,
@@ -24,6 +26,11 @@ from vllm_fl.configs.ascend import (
     get_ascend_additional_config,
     get_ascend_config,
     init_ascend_config,
+    shared_expert_dp_enabled,
+)
+from vllm_fl.distributed.ascend_moe_runtime import (
+    npu_stream_switch,
+    shared_experts_calculation_stream,
 )
 
 
@@ -55,36 +62,58 @@ def dispose_tensor(_tensor) -> None:
 
 
 def maybe_trans_nz(tensor: torch.Tensor) -> torch.Tensor:
-    # A2 BF16 grouped matmul accepts the contiguous ND layout produced below.
-    return tensor
+    """Opt-in BF16 expert NZ weights; convert once during model loading.
 
-
-def npu_stream_switch(target_stream=None, *, enabled: bool = True):
+    The previous shim ignored weight_nz_mode=2 for ordinary MoE. Keep that
+    behavior by default, and constrain the A3 Qwen3-VL topology before
+    enabling the native GMM weight layout. No quantization or routing changes.
+    """
+    extra = get_ascend_additional_config()
+    enabled = extra.get("fl_moe_bf16_nz", False)
+    if not isinstance(enabled, bool):
+        raise TypeError("fl_moe_bf16_nz must be a JSON boolean")
     if not enabled:
-        return nullcontext()
-    assert target_stream is not None
-    return torch.npu.stream(target_stream)
+        return tensor
+    cfg = _current_vllm_config_or_none()
+    if cfg is None:
+        raise RuntimeError("fl_moe_bf16_nz requires an active worker config")
+    parallel = cfg.parallel_config
+    model = cfg.model_config
+    if not (
+        get_ascend_device_type() is AscendDeviceType.A3
+        and extra.get("weight_nz_mode") == 2
+        and model.dtype == torch.bfloat16
+        and model.quantization is None
+        and getattr(model.hf_text_config, "model_type", None) == "qwen3_vl_moe_text"
+        and parallel.tensor_parallel_size == 2
+        and parallel.data_parallel_size == 1
+        and parallel.pipeline_parallel_size == 1
+        and parallel.enable_expert_parallel
+        and not parallel.enable_eplb
+        and not parallel.use_ubatching
+        and cfg.lora_config is None
+        and cfg.speculative_config is None
+        and not tensor.is_meta
+        and tensor.device.type == "npu"
+        and tensor.dtype == torch.bfloat16
+        and tuple(tensor.shape) in {(64, 2048, 1536), (64, 768, 2048)}
+    ):
+        raise ValueError("fl_moe_bf16_nz supports A3 Qwen3-VL BF16 TP2/EP, DP1 only")
+    import torch_npu
 
-
-def shared_expert_dp_enabled() -> bool:
-    config = get_ascend_config()
-    flashcomm1_enabled = enable_sp(
-        enable_shared_expert_dp=config.enable_shared_expert_dp
+    result = torch_npu.npu_format_cast(tensor, ACL_FORMAT_FRACTAL_NZ)
+    result_format = torch_npu.get_npu_format(result)
+    if result_format != ACL_FORMAT_FRACTAL_NZ:
+        raise RuntimeError(
+            "BF16 expert NZ conversion did not produce FRACTAL_NZ: "
+            f"got format {result_format!r}"
+        )
+    logger.info(
+        "FL BF16 expert NZ enabled: shape=%s, dtype=%s",
+        tuple(tensor.shape),
+        tensor.dtype,
     )
-    return bool(
-        config.enable_shared_expert_dp or flashcomm1_enabled or enable_sp_by_pass()
-    )
-
-
-def shared_experts_calculation_stream():
-    global _SHARED_EXPERTS_CALCULATION_STREAM
-    if _SHARED_EXPERTS_CALCULATION_STREAM is None:
-        # Keep torch_npu behind the Ascend-only call path so importing FL on a
-        # different vendor does not initialize the NPU runtime.
-        import torch_npu
-
-        _SHARED_EXPERTS_CALCULATION_STREAM = torch_npu.npu.Stream()
-    return _SHARED_EXPERTS_CALCULATION_STREAM
+    return result
 
 
 def get_mc2_group():

@@ -47,6 +47,12 @@ class AscendBackend(Backend):
         return AscendBackend._available
 
     # ==================== Operator Implementations ====================
+    def fused_experts(self, *args, **kwargs):
+        """Stable expert-call seam; implementation owns routing and math."""
+        from .impl.fused_moe import fused_experts_impl
+
+        return fused_experts_impl(*args, **kwargs)
+
     def silu_and_mul(self, obj, x: torch.Tensor) -> torch.Tensor:
         """
         SiLU activation followed by element-wise multiplication.

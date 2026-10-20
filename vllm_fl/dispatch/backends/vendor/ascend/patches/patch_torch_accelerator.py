@@ -11,7 +11,6 @@ platform lifecycle and delegate to torch-npu's native memory APIs.
 
 import torch
 
-
 _PATCH_MARKER = "_fl_ascend_torch_accelerator_patched"
 _NPU_MEMORY_API_MAP = {
     "empty_cache": "empty_cache",

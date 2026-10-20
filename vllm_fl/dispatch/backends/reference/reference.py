@@ -67,6 +67,11 @@ class ReferenceBackend(Backend):
 
         return silu_and_mul_torch(obj, x)
 
+    def silu_and_mul_with_clamp(self, obj, x: torch.Tensor) -> torch.Tensor:
+        from .impl.activation import silu_and_mul_with_clamp_torch
+
+        return silu_and_mul_with_clamp_torch(obj, x)
+
     def gelu_and_mul(self, obj, x: torch.Tensor) -> torch.Tensor:
         """
         GELU activation followed by element-wise multiplication.

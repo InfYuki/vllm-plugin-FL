@@ -46,7 +46,11 @@ class RotaryEmbeddingFL(RotaryEmbedding):
         query: torch.Tensor,
         key: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
+        cos_sin_cache = self.cos_sin_cache.to(positions.device)
+        # Follow upstream's compile-safe buffer handling, retaining FL's
+        # device-only conversion and the existing cache dtype.
+        if current_platform.device_type != "npu" or not torch.compiler.is_compiling():
+            self.cos_sin_cache = cos_sin_cache
         positions = positions.flatten()
 
         if current_platform.device_type == "npu" and key is not None:
@@ -54,7 +58,7 @@ class RotaryEmbeddingFL(RotaryEmbedding):
                 positions,
                 query,
                 key,
-                self.cos_sin_cache,
+                cos_sin_cache,
                 self.head_size,
                 self.rotary_dim,
                 self.is_neox_style,
@@ -73,7 +77,7 @@ class RotaryEmbeddingFL(RotaryEmbedding):
             query_pass = query[..., self.rotary_dim:]
             key_pass = key[..., self.rotary_dim:]
 
-        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
+        cos, sin = cos_sin_cache.chunk(2, dim=-1)
 
         q_embed, k_embed = _rotary_embedding(
             self,

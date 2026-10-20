@@ -74,6 +74,11 @@ class FlagGemsBackend(Backend):
 
         return silu_and_mul_flaggems(obj, x)
 
+    def silu_and_mul_with_clamp(self, obj, x: torch.Tensor) -> torch.Tensor:
+        from .impl.activation import silu_and_mul_with_clamp_flaggems
+
+        return silu_and_mul_with_clamp_flaggems(obj, x)
+
     def gelu_and_mul(self, obj, x: torch.Tensor) -> torch.Tensor:
         """
         GELU activation followed by element-wise multiplication.
@@ -189,7 +194,9 @@ class FlagGemsBackend(Backend):
 
         if use_flaggems_attn:
             print("Using FlagGems attention backend.")
-            return "vllm_fl.dispatch.backends.flaggems.impl.attention.AttentionFLBackend"
+            return (
+                "vllm_fl.dispatch.backends.flaggems.impl.attention.AttentionFLBackend"
+            )
 
         return AttentionBackendEnum.TRITON_ATTN.get_path()
 
@@ -294,6 +301,12 @@ class FlagGemsBackend(Backend):
         from .impl.fused_moe import grouped_topk_flaggems
 
         return grouped_topk_flaggems(
-            scores, n_group, topk_group, topk,
-            renormalize, routed_scaling_factor, bias, scoring_func,
+            scores,
+            n_group,
+            topk_group,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            bias,
+            scoring_func,
         )

@@ -1,46 +1,15 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 """Vendor-owned MiniMax-M3 model classes for Ascend.
 
-Why this file exists
---------------------
-Upstream vLLM's MiniMax-M3 classes carry no ``@support_torch_compile``, and
-vLLM auto-detects that *by architecture name* and routes the model to the
-breakable-cudagraph path instead of the normal compile path. On Ascend that
-means the whole M3 forward runs eagerly, which measured ~15% slower decode
-(TPOT 51.3 ms vs 45.3 ms for vLLM-Ascend on 910C, DP2xTP8+EP,
-FULL_DECODE_ONLY, identical serve flags).
+Reuse upstream model construction and add compile-capable Ascend subclasses.
+Pure QK-norm/RoPE runs in the traced forward; cache writes, indexer selection
+and sparse attention run through an opaque custom op, following the matching
+vLLM-Ascend integration boundary. The op resolves its layer through
+``forward_context.no_compile_layers`` so stateful effects survive graph replay.
 
-Adding the decorator alone is not enough. The M3 forward performs several
-in-place writes, and under the npugraph_ex backend those effects are not
-preserved across graph replay, so the model emits garbled completions:
-
-* ``fused_minimax_m3_qknorm_rope_kv_insert`` rewrites ``qkv`` in place and
-  scatter-inserts K/V and the index key into the paged KV and indexer caches;
-* the indexer fills a shared ``topk_indices_buffer`` and hands back views
-  into it;
-* the attend writes into a preallocated output buffer.
-
-vLLM-Ascend solves the same problem by registering its attend as one opaque
-custom op whose body reaches the real layer through
-``forward_context.no_compile_layers``. This module follows that approach while
-keeping the upstream model classes: the two attention classes are subclassed
-so their in-place region goes through an opaque op, the top-level model
-subclass adds the compile decorator, and the upstream module's own names are
-rebound so the unmodified ``DecoderLayer`` / ``ForCausalLM`` construction
-picks them up.
-
-The opaque region is deliberately wider than vLLM-Ascend's. Upstream fuses
-QK-norm/RoPE with the cache insert into a single operator that runs *before*
-the attend, so the region has to start there; vLLM-Ascend's port performs the
-insert inside its attention class instead and can therefore wrap only the
-attend.
-
-Narrowing the region to just the cache insert plus attend was tried and
-reverted: it measured no faster (decode TPOT unchanged at C=2, ~3 ms worse at
-C=4) and it hung once. With ``cudagraph_mode=FULL_DECODE_ONLY`` the whole
-forward is captured either way, so an opaque op's kernels replay straight from
-the graph and its Python body does not re-run per token -- the host-dispatch
-saving that motivated the change does not exist in this configuration.
+Cache allocation and multi-cache binding remain owned by the FL runner and
+``vllm_fl.kv_cache.ascend``; model registration does not replace vLLM's global
+cache-binding function.
 """
 
 from __future__ import annotations

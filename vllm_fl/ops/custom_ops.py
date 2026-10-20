@@ -1,13 +1,13 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
 
 import logging
-from typing import List, Optional
 
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
-from .layernorm import *  # noqa F403 F401
+
 from .activation import *  # noqa F403 F401
-from .rotary_embedding import *  # noqa F403 F401
 from .fused_moe import *  # noqa F403 F401
+from .layernorm import *  # noqa F403 F401
+from .rotary_embedding import *  # noqa F403 F401
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # note: cannot control inner gems op of UnquantizedFusedMoEMethodFL via env variable.
 OOT_OPS = {
     "silu_and_mul": (SiluAndMulFL, "SiluAndMul"),  # noqa F405
+    "silu_and_mul_with_clamp": (SiluAndMulWithClampFL, "SiluAndMulWithClamp"),  # noqa F405
     "gelu_and_mul": (GeluAndMulFL, "GeluAndMul"),  # noqa F405
     "rms_norm": (RMSNormFL, "RMSNorm"),  # noqa F405
     "rotary_embedding": (RotaryEmbeddingFL, "RotaryEmbedding"),  # noqa F405
@@ -35,7 +36,9 @@ OOT_OPS = {
 # These public vLLM registration names are owned by the Ascend vendor lifecycle.
 # The corresponding generic FL operators must not overwrite them after
 # ``apply_ascend_patches`` has installed the current-vLLM-Ascend implementation.
-_ASCEND_VENDOR_OWNED_REGISTRATIONS = frozenset({"RMSNorm"})
+_ASCEND_VENDOR_OWNED_REGISTRATIONS = frozenset(
+    {"RMSNorm", "SiluAndMulWithClamp"}
+)
 
 
 def _register_oot_once(op_cls: type, registration_name: str) -> None:
@@ -76,15 +79,18 @@ def _patch_unquantized_moe_oracle() -> None:
     would get (OOT, None), skip _setup_kernel, and crash at inference time.
     """
     import vllm.model_executor.layers.fused_moe.oracle.unquantized as _oracle_mod
+
     from vllm_fl.ops.fused_moe.fused_moe_utils import select_unquantized_moe_backend_oot
+
     _oracle_mod.select_unquantized_moe_backend = select_unquantized_moe_backend_oot
     # Also patch the import in unquantized_fused_moe_method module
     import vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method as _method_mod
+
     _method_mod.select_unquantized_moe_backend = select_unquantized_moe_backend_oot
     logger.info("Patched select_unquantized_moe_backend to bypass OOT short-circuit")
 
 
-def register_oot_ops(whitelist: Optional[List[str]] = None) -> None:
+def register_oot_ops(whitelist: list[str] | None = None) -> None:
     """
     Register OOT (out-of-tree) custom operators.
 
@@ -201,7 +207,6 @@ def register_oot_ops(whitelist: Optional[List[str]] = None) -> None:
 def _patch_fused_moe_factory() -> None:
     """Replace the FusedMoE factory function with FusedMoEFL in all relevant
     vllm modules so that model code picks up the FL version automatically."""
-    import inspect
     import vllm.model_executor.layers.fused_moe as _fused_moe_pkg
     import vllm.model_executor.layers.fused_moe.layer as _fused_moe_layer
     from vllm.platforms import current_platform

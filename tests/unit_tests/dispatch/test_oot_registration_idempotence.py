@@ -38,8 +38,12 @@ def _configure_registration(monkeypatch, *, vendor_name: str, device_type: str):
     return custom_ops
 
 
-def test_ascend_vendor_keeps_rmsnorm_and_generic_operators_register(
-    monkeypatch, isolated_oot_registry
+@pytest.mark.parametrize(
+    ("op_name", "registration_name"),
+    [("rms_norm", "RMSNorm"), ("silu_and_mul_with_clamp", "SiluAndMulWithClamp")],
+)
+def test_ascend_vendor_keeps_owned_and_generic_operators_register(
+    monkeypatch, isolated_oot_registry, op_name, registration_name
 ) -> None:
     from vllm.model_executor.custom_op import CustomOp
     from vllm_fl.ops.activation import SiluAndMulFL
@@ -49,21 +53,21 @@ def test_ascend_vendor_keeps_rmsnorm_and_generic_operators_register(
     )
     import vllm_fl.dispatch.backends.vendor.ascend.patch as ascend_patch
 
-    class AscendRMSNorm:
+    class AscendOwner:
         pass
 
     def apply_vendor_patch():
-        if "RMSNorm" not in isolated_oot_registry:
+        if registration_name not in isolated_oot_registry:
             CustomOp.register_oot(
-                _decorated_op_cls=AscendRMSNorm, name="RMSNorm"
+                _decorated_op_cls=AscendOwner, name=registration_name
             )
 
     monkeypatch.setattr(ascend_patch, "apply_ascend_patches", apply_vendor_patch)
 
-    custom_ops.register_oot_ops(whitelist=["rms_norm", "silu_and_mul"])
-    custom_ops.register_oot_ops(whitelist=["rms_norm", "silu_and_mul"])
+    custom_ops.register_oot_ops(whitelist=[op_name, "silu_and_mul"])
+    custom_ops.register_oot_ops(whitelist=[op_name, "silu_and_mul"])
 
-    assert isolated_oot_registry["RMSNorm"] is AscendRMSNorm
+    assert isolated_oot_registry[registration_name] is AscendOwner
     assert isolated_oot_registry["SiluAndMul"] is SiluAndMulFL
 
 
@@ -155,11 +159,10 @@ def test_ascend_vendor_collision_is_not_hidden(
     ("vendor_name", "device_type"),
     [("cuda", "cuda"), ("other", "npu")],
 )
-def test_non_ascend_platforms_keep_generic_rmsnorm(
-    monkeypatch, isolated_oot_registry, vendor_name, device_type
+@pytest.mark.parametrize("op_name", ["rms_norm", "silu_and_mul_with_clamp"])
+def test_non_ascend_platforms_keep_generic_owned_overlap(
+    monkeypatch, isolated_oot_registry, vendor_name, device_type, op_name
 ) -> None:
-    from vllm_fl.ops.layernorm import RMSNormFL
-
     custom_ops = _configure_registration(
         monkeypatch, vendor_name=vendor_name, device_type=device_type
     )
@@ -170,9 +173,10 @@ def test_non_ascend_platforms_keep_generic_rmsnorm(
         "apply_ascend_patches",
         lambda: pytest.fail("non-Ascend platform called Ascend lifecycle"),
     )
-    custom_ops.register_oot_ops(whitelist=["rms_norm"])
+    custom_ops.register_oot_ops(whitelist=[op_name])
 
-    assert isolated_oot_registry["RMSNorm"] is RMSNormFL
+    op_cls, registration_name = custom_ops.OOT_OPS[op_name]
+    assert isolated_oot_registry[registration_name] is op_cls
 
 
 def test_oot_disabled_still_applies_ascend_vendor_lifecycle(
@@ -240,6 +244,7 @@ def test_ascend_vendor_owned_set_matches_current_generic_overlap() -> None:
         "MMEncoderAttention",
         "GatedDeltaNetAttention",
         "RMSNorm",
+        "SiluAndMulWithClamp",
         "GemmaRMSNorm",
         "RMSNormGated",
         "VocabParallelEmbedding",
@@ -252,5 +257,5 @@ def test_ascend_vendor_owned_set_matches_current_generic_overlap() -> None:
     assert (
         generic_registered_names & ascend_registered_names
         == _ASCEND_VENDOR_OWNED_REGISTRATIONS
-        == {"RMSNorm"}
+        == {"RMSNorm", "SiluAndMulWithClamp"}
     )

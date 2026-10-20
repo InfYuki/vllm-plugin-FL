@@ -42,6 +42,7 @@ def register_builtins(registry) -> None:
     op_names = (
         "dynamic_per_token_quant_int8",
         "silu_and_mul",
+        "silu_and_mul_with_clamp",
         "gelu_and_mul",
         "rms_norm",
         "rotary_embedding",

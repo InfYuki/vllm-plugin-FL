@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 BAAI. All rights reserved.
 
-"""Ascend graph compiler integration owned by the FL plugin.
+"""Opt-in Ascend npugraph compiler retained for existing DSv4 launch scripts.
 
 This module implements the current Ascend npugraph_ex path and its fusion-only
 fallback. Other Ascend compilation modes fail closed until their matching
@@ -43,7 +43,7 @@ logger = init_logger(__name__)
 class AscendCompilerOptions:
     """The supported subset of the current Ascend compilation config."""
 
-    enable_npugraph_ex: bool = True
+    enable_npugraph_ex: bool = False
     enable_static_kernel: bool = False
     fuse_norm_quant: bool = True
     fuse_qknorm_rope: bool = True

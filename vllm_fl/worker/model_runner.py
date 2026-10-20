@@ -495,41 +495,6 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
-def _make_dense_mamba_state_views(
-    raw_tensor: torch.Tensor,
-    num_blocks: int,
-    shapes: Sequence[tuple[int, ...]],
-    dtypes: Sequence[torch.dtype],
-) -> list[torch.Tensor]:
-    """Group every Mamba state type densely across cache blocks.
-
-    Ascend GDN kernels index state rows directly. A page-interleaved strided
-    view can force the NPU indexing kernel to materialize the whole state
-    cache before selecting a request. Keep the allocation shared with the
-    attention cache, but partition the Mamba region by state type, matching
-    the current vLLM-Ascend layout.
-    """
-    assert len(shapes) == len(dtypes)
-    assert raw_tensor.element_size() == 1, (
-        "Ascend dense Mamba state backing must use one-byte elements"
-    )
-    storage_offset_bytes = 0
-    state_tensors: list[torch.Tensor] = []
-    for shape, dtype in zip(shapes, dtypes):
-        dtype_size = get_dtype_size(dtype)
-        assert storage_offset_bytes % dtype_size == 0
-        num_state_bytes = num_blocks * math.prod(shape) * dtype_size
-        storage_end_bytes = storage_offset_bytes + num_state_bytes
-        assert storage_end_bytes <= raw_tensor.nbytes
-        state_tensors.append(
-            raw_tensor[storage_offset_bytes:storage_end_bytes]
-            .view(dtype)
-            .view(num_blocks, *shape)
-        )
-        storage_offset_bytes = storage_end_bytes
-    return state_tensors
-
-
 class ModelRunnerFL(GPUModelRunner):
     def __init__(
         self,
@@ -4068,7 +4033,6 @@ class ModelRunnerFL(GPUModelRunner):
         self,
         query_start_loc: CpuGpuBuffer,
         num_tokens_padded: int,
-        num_reqs_padded: int,
         num_reqs: int,
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         batch_desc_num_reqs: int | None = None,
@@ -5203,7 +5167,6 @@ class ModelRunnerFL(GPUModelRunner):
                 num_reqs_padded = self._pad_query_start_loc_for_fia(
                     self.query_start_loc,
                     num_tokens_padded,
-                    num_reqs_padded,
                     num_reqs,
                     cudagraph_mode,
                     batch_desc.num_reqs,
@@ -6992,7 +6955,6 @@ class ModelRunnerFL(GPUModelRunner):
                     num_reqs_padded = self._pad_query_start_loc_for_fia(
                         self.query_start_loc,
                         num_tokens_padded,
-                        num_reqs_padded,
                         num_reqs,
                         cudagraph_runtime_mode,
                         batch_desc.num_reqs,
@@ -7629,6 +7591,8 @@ class ModelRunnerFL(GPUModelRunner):
         from vllm.v1.worker.workspace import reset_workspace_manager
 
         # Calls torch.accelerator.synchronize()
+        if self.graph_runtime is not None:
+            self.graph_runtime.clear_decoder_graphs()
         self._cleanup_profiling_kv_cache()
         if current_platform.is_rocm():
             # Drop captured graphs before distributed teardown. On ROCm, delayed
@@ -7871,8 +7835,11 @@ class ModelRunnerFL(GPUModelRunner):
                     )
         finally:
             set_cudagraph_capturing_enabled(False)
-            GraphWrapper.clear_all_graphs()
-            BreakableCUDAGraphWrapper.clear_all_graphs()
+            if self.graph_runtime is not None:
+                self.graph_runtime.clear_decoder_graphs()
+            else:
+                GraphWrapper.clear_all_graphs()
+                BreakableCUDAGraphWrapper.clear_all_graphs()
             if encoder_cudagraph_manager is not None:
                 encoder_cudagraph_manager.clear()
             all_wrappers = list(GraphWrapper._all_instances) + list(
@@ -8769,26 +8736,10 @@ class ModelRunnerFL(GPUModelRunner):
                         current_platform.device_type == "npu"
                         and self.hybrid_with_attn_and_mamba
                     ):
-                        dtype_size = get_dtype_size(kv_cache_spec.dtype)
-                        attn_region_nbytes = (
-                            math.prod(kv_cache_shape) * dtype_size
-                        )
-                        raw_nbytes = raw_tensor.nbytes
-                        assert attn_region_nbytes <= raw_nbytes, (
-                            "Ascend hybrid attention region does not fit in "
-                            f"the planned KV tensor: {attn_region_nbytes} > "
-                            f"{raw_nbytes} bytes for {layer_name}"
-                        )
-                        attn_region_offset = raw_nbytes - attn_region_nbytes
-                        assert attn_region_offset % dtype_size == 0
-                        assert raw_tensor.element_size() == 1, (
-                            "Ascend dense hybrid attention backing must use "
-                            "one-byte elements"
-                        )
-                        kv_caches[layer_name] = (
-                            raw_tensor[attn_region_offset:]
-                            .view(kv_cache_spec.dtype)
-                            .view(kv_cache_shape)
+                        from vllm_fl.kv_cache.ascend.hybrid import dense_attention_view
+
+                        kv_caches[layer_name] = dense_attention_view(
+                            raw_tensor, kv_cache_spec, kv_cache_shape
                         )
                         continue
                     try:
@@ -8810,11 +8761,11 @@ class ModelRunnerFL(GPUModelRunner):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     if current_platform.device_type == "npu":
-                        state_tensors = _make_dense_mamba_state_views(
-                            raw_tensor,
-                            num_blocks,
-                            kv_cache_spec.shapes,
-                            kv_cache_spec.dtypes,
+                        from vllm_fl.kv_cache.ascend.hybrid import dense_mamba_views
+
+                        assert len(kv_cache_spec.shapes) == len(kv_cache_spec.dtypes)
+                        state_tensors = dense_mamba_views(
+                            raw_tensor, kv_cache_spec, num_blocks
                         )
                     else:
                         state_tensors = []
@@ -9202,8 +9153,6 @@ class ModelRunnerFL(GPUModelRunner):
         if has_ec_transfer() and not get_ec_transfer().is_consumer:
             return {}
         kv_cache_spec: dict[str, KVCacheSpec] = {}
-        attention_layer_names: set[str] = set()
-        mamba_page_size_padded = 0
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
         for layer_name, attn_module in attn_layers.items():
@@ -9275,11 +9224,6 @@ class ModelRunnerFL(GPUModelRunner):
                     with set_current_vllm_config(self.vllm_config):
                         indexes = backend.indexes_kv_by_block_stride()
                     spec = replace(spec, indexes_kv_by_block_stride=indexes)
-                    attention_layer_names.add(layer_name)
-                elif isinstance(spec, MambaSpec):
-                    mamba_page_size_padded = max(
-                        mamba_page_size_padded, spec.page_size_bytes
-                    )
                 kv_cache_spec[layer_name] = spec
 
         # Ascend hybrid cache groups share one physical page between attention
@@ -9287,16 +9231,10 @@ class ModelRunnerFL(GPUModelRunner):
         # accounting for the larger Mamba page during group planning.  This is
         # the current vLLM-Ascend contract and is required when the model-derived
         # attention block size does not make both page sizes exactly equal.
-        if (
-            current_platform.device_type == "npu"
-            and mamba_page_size_padded > 0
-        ):
-            for layer_name in attention_layer_names:
-                spec = kv_cache_spec[layer_name]
-                if spec.page_size_bytes < mamba_page_size_padded:
-                    kv_cache_spec[layer_name] = replace(
-                        spec, page_size_padded=mamba_page_size_padded
-                    )
+        if current_platform.device_type == "npu":
+            from vllm_fl.kv_cache.ascend.hybrid import pad_attention_specs
+
+            kv_cache_spec = pad_attention_specs(kv_cache_spec)
 
         return kv_cache_spec
 

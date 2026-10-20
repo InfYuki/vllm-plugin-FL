@@ -14,6 +14,36 @@ class DeviceOperator:
     """
 
     @staticmethod
+    def causal_conv1d_custom(
+        output, x, weight, *, conv_state, bias_opt, query_start_loc_opt,
+        cache_indices_opt, initial_state_mode_opt, num_accepted_tokens_opt,
+        activation_mode, pad_slot_id, run_mode,
+    ):
+        """Update caller-owned convolution/output buffers without rebinding."""
+        return torch.ops._C_ascend.npu_causal_conv1d_custom(
+            output, x, weight, conv_state=conv_state, bias_opt=bias_opt,
+            query_start_loc_opt=query_start_loc_opt,
+            cache_indices_opt=cache_indices_opt,
+            initial_state_mode_opt=initial_state_mode_opt,
+            num_accepted_tokens_opt=num_accepted_tokens_opt,
+            activation_mode=activation_mode, pad_slot_id=pad_slot_id,
+            run_mode=run_mode,
+        )
+
+    @staticmethod
+    def recurrent_gated_delta_rule(
+        *, query, key, value, g, beta, state, scale, actual_seq_lengths,
+        ssm_state_indices, num_accepted_tokens=None,
+    ):
+        """Native recurrence with in-place state mutation and unchanged dtype."""
+        return torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+            query=query, key=key, value=value, g=g, beta=beta, state=state,
+            scale=scale, actual_seq_lengths=actual_seq_lengths,
+            ssm_state_indices=ssm_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+        )
+
+    @staticmethod
     def npu_mm_reduce_scatter_base(
         x1: torch.Tensor,
         x2: torch.Tensor,

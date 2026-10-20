@@ -159,7 +159,11 @@ def get_ascend_config():
             "recompute_scheduler_enable is ignored on PD-disaggregated P nodes; "
             "configure it only on D nodes"
         )
-    compilation = _nested_config(extra, "ascend_compilation_config")
+    from vllm_fl.compilation.config import validate_ascend_compilation_options
+
+    compilation = validate_ascend_compilation_options(
+        _nested_config(extra, "ascend_compilation_config")
+    )
     fusion = _nested_config(extra, "ascend_fusion_config")
     eplb = _nested_config(extra, "eplb_config")
     finegrained_tp = _nested_config(extra, "finegrained_tp_config")
@@ -285,9 +289,6 @@ def get_ascend_config():
         "MC2 hierarchy communication",
     )
     _reject_unsupported(eplb_requested, "EPLB")
-    if (compilation.get("enable_static_kernel", False)
-            and not compilation.get("enable_npugraph_ex", True)):
-        raise ValueError("enable_static_kernel requires enable_npugraph_ex=True")
     _reject_unsupported(
         bool(fusion.get("fusion_ops_gmmswigluquant", False)),
         "gmmswigluquant fusion",
@@ -374,14 +375,7 @@ def get_ascend_config():
         finegrained_tp_config=SimpleNamespace(
             **requested_finegrained,
         ),
-        ascend_compilation_config=SimpleNamespace(
-            enable_npugraph_ex=compilation.get("enable_npugraph_ex", True),
-            enable_static_kernel=compilation.get("enable_static_kernel", False),
-            fuse_norm_quant=compilation.get("fuse_norm_quant", True),
-            fuse_qknorm_rope=compilation.get("fuse_qknorm_rope", True),
-            fuse_allreduce_rms=compilation.get("fuse_allreduce_rms", False),
-            fuse_muls_add=compilation.get("fuse_muls_add", True),
-        ),
+        ascend_compilation_config=SimpleNamespace(**compilation),
         # FL's current AllGather MoE never enables this quantized fusion.
         ascend_fusion_config=SimpleNamespace(fusion_ops_gmmswigluquant=False),
         eplb_config=SimpleNamespace(
@@ -431,3 +425,13 @@ def enable_sp_by_pass() -> bool:
     compilation_config = getattr(vllm_config, "compilation_config", None)
     pass_config = getattr(compilation_config, "pass_config", None)
     return bool(getattr(pass_config, "enable_sp", False))
+
+
+def shared_expert_dp_enabled() -> bool:
+    config = get_ascend_config()
+    flashcomm1_enabled = enable_sp(
+        enable_shared_expert_dp=config.enable_shared_expert_dp
+    )
+    return bool(
+        config.enable_shared_expert_dp or flashcomm1_enabled or enable_sp_by_pass()
+    )

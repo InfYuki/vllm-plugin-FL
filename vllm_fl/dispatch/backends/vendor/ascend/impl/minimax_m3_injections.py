@@ -231,18 +231,6 @@ def _install_flashinfer_injection() -> bool:
 # ---------------------------------------------------------------------------
 # Injection 3: SiluAndMulWithClamp (no NPU branch upstream)
 # ---------------------------------------------------------------------------
-def _install_bind_kv_cache_injection() -> bool:
-    """Allow a decoder layer to own several attention caches on OOT platforms.
-
-    MiniMax-M3 registers both a main K/V cache and an indexer cache per sparse
-    layer; upstream ``bind_kv_cache`` raises NotImplementedError for that case
-    on any non-CUDA/XPU/CPU platform.
-    """
-    from .minimax_m3_kv_bind import install_bind_kv_cache_patch
-
-    return install_bind_kv_cache_patch()
-
-
 def _install_apply_rotary_emb_injection() -> bool:
     """Partial-rotary correctness for the vision tower (see the module docstring
     of ``apply_rotary_emb.py`` for the measured failure it fixes)."""
@@ -359,7 +347,6 @@ def install_minimax_m3_injections() -> bool:
         "activation": _install_activation_injection(),
         "allreduce_norm": _install_allreduce_norm_injection(),
         "apply_rotary_emb": _install_apply_rotary_emb_injection(),
-        "bind_kv_cache": _install_bind_kv_cache_injection(),
     }
     logger.info(
         "MiniMax-M3 Ascend injections: %s",

@@ -94,4 +94,12 @@ def register_builtins(registry: OpRegistry) -> None:
         ),
     ]
 
+    impls.append(OpImpl(
+        op_name="fused_experts",
+        impl_id="vendor.ascend",
+        kind=BackendImplKind.VENDOR,
+        fn=_bind_is_available(backend.fused_experts, is_avail),
+        vendor="ascend",
+        priority=BackendPriority.VENDOR,
+    ))
     registry.register_many(impls)
