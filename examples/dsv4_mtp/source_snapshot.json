@@ -7,7 +7,7 @@
     {
       "path": "vllm_fl/worker/model_runner.py",
       "before_sha256": "c5119fce3ee0165b454a67957e7a495ab98acb8499b5d4a3d0a87d0d328c1671",
-      "sha256": "82addb1a26620ee66c866a039c6e773040641897b09c9a8eebb75a54d1a64c4d"
+      "sha256": "06e127f27dfb74eefcfb6f4e049ad9274fec8492b2ce3210a89a5bcba798753b"
     },
     {
       "path": "vllm_fl/dispatch/backends/vendor/ascend/patches/patch_deepseek_v4.py",
@@ -275,6 +275,12 @@
     "requested_by_default": true,
     "scope": "DSv4 async MTP: reuse CPU acceptance-count list only within one completed D2H generation and matching owners; invalidate before every copy; preserve first wait",
     "validation": "AST, shell syntax and source identity only; runtime correctness and performance pending user tests",
+    "runtime_tested": false
+  },
+  "dsv4_max_context_dp_fix": {
+    "parent_commit": "28e0da0e28210f385dad5fe68c5a6046fd517225",
+    "scope": "DSv4 prepared MTP DP>1: out-of-range rank retains zero drafts and joins same packed coordination plus K dummy forwards",
+    "validation": "AST and source checks only; runtime untested",
     "runtime_tested": false
   }
 }

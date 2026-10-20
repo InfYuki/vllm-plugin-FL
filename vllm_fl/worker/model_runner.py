@@ -5545,6 +5545,20 @@ class ModelRunnerFL(GPUModelRunner):
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
                     )
+                if (not input_fits_in_drafter and self.use_compress
+                        and spec_config.method == "mtp"
+                        and self.parallel_config.data_parallel_size > 1
+                        and getattr(self.drafter, "_prepare_steps", False)):
+                    # Other DP ranks may still propose. Join the prepared
+                    # drafter's packed coordination and K EP forwards, without
+                    # using out-of-range attention metadata or writing KV.
+                    draft_steps = scheduler_output.num_spec_tokens_to_schedule
+                    if not 1 <= draft_steps <= 3:
+                        raise ValueError("DSv4 prepared dummy steps require K1..3")
+                    self.drafter.num_speculative_tokens = draft_steps
+                    self.drafter.dummy_run(
+                        1, use_cudagraphs=False, is_graph_capturing=False,
+                        slot_mappings=slot_mappings)
             elif (
                 spec_config.use_ngram_gpu()
                 and not spec_config.disable_padded_drafter_batch
