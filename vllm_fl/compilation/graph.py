@@ -8,7 +8,7 @@ import dataclasses
 import weakref
 from collections import Counter
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from typing import Any, ClassVar
 from unittest.mock import patch
 
@@ -153,9 +153,7 @@ class GraphWrapper:
             and vllm_config.parallel_config.tensor_parallel_size > 1
             and runtime_mode == CUDAGraphMode.PIECEWISE
         )
-        self.graph_runtime = graph_runtime or GraphRuntimeController(
-            vllm_config=vllm_config
-        )
+        self.graph_runtime = graph_runtime
 
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
@@ -240,8 +238,11 @@ class GraphWrapper:
                 # Keep the capture-time buffers alive so replay can copy
                 # runtime values back to the addresses recorded by the graph.
                 entry.input_tensors = input_tensors
-            entry.input_bindings = self.graph_runtime.bind_static_inputs(args)
-            graph = self.graph_runtime.create_graph()
+            entry.input_bindings = StaticInputBindings.from_args(args)
+            graph = (
+                self.graph_runtime.create_graph()
+                if self.graph_runtime is not None else Graph.graph()
+            )
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -267,7 +268,10 @@ class GraphWrapper:
 
                 # FL-specific: use platform-agnostic graph capture. The runtime
                 # scope receives the live attention metadata via ForwardContext.
-                with self.graph_runtime.capture_scope(forward_context):
+                with (
+                    self.graph_runtime.capture_scope(forward_context)
+                    if self.graph_runtime is not None else nullcontext()
+                ):
                     with current_platform.torch_device_fn.graph(
                         graph, pool=self.graph_pool
                     ):
@@ -308,6 +312,9 @@ class GraphWrapper:
         except (ImportError, RuntimeError):
             pass
 
-        with self.graph_runtime.replay_scope(forward_context):
+        with (
+            self.graph_runtime.replay_scope(forward_context)
+            if self.graph_runtime is not None else nullcontext()
+        ):
             entry.graph.replay()
         return entry.output

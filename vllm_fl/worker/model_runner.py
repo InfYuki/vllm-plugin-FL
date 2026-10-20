@@ -3966,7 +3966,6 @@ class ModelRunnerFL(GPUModelRunner):
         self,
         query_start_loc: CpuGpuBuffer,
         num_tokens_padded: int,
-        num_reqs_padded: int,
         num_reqs: int,
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         batch_desc_num_reqs: int | None = None,
@@ -5101,7 +5100,6 @@ class ModelRunnerFL(GPUModelRunner):
                 num_reqs_padded = self._pad_query_start_loc_for_fia(
                     self.query_start_loc,
                     num_tokens_padded,
-                    num_reqs_padded,
                     num_reqs,
                     cudagraph_mode,
                     batch_desc.num_reqs,
@@ -6841,7 +6839,6 @@ class ModelRunnerFL(GPUModelRunner):
                     num_reqs_padded = self._pad_query_start_loc_for_fia(
                         self.query_start_loc,
                         num_tokens_padded,
-                        num_reqs_padded,
                         num_reqs,
                         cudagraph_runtime_mode,
                         batch_desc.num_reqs,
