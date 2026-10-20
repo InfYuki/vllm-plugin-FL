@@ -33,6 +33,39 @@ OOT_OPS = {
     # "unquantized_fused_moe_method": (UnquantizedFusedMoEMethodFL, "UnquantizedFusedMoEMethod"),
 }
 
+# These public vLLM registration names are owned by the Ascend vendor lifecycle.
+# The corresponding generic FL operators must not overwrite them after
+# ``apply_ascend_patches`` has installed the current-vLLM-Ascend implementation.
+_ASCEND_VENDOR_OWNED_REGISTRATIONS = frozenset(
+    {"RMSNorm", "SiluAndMulWithClamp"}
+)
+
+
+def _register_oot_once(op_cls: type, registration_name: str) -> None:
+    """Register an OOT class idempotently without hiding ownership conflicts."""
+    from vllm.model_executor.custom_op import op_registry_oot
+
+    existing_cls = op_registry_oot.get(registration_name)
+    if existing_cls is op_cls:
+        logger.debug(
+            "OOT op '%s' is already registered by %s; keeping the existing owner",
+            registration_name,
+            op_cls,
+        )
+        return
+    if existing_cls is not None:
+        raise RuntimeError(
+            f"OOT op '{registration_name}' is already registered by "
+            f"{existing_cls!r}; refusing to replace it with {op_cls!r}"
+        )
+
+    if issubclass(op_cls, PluggableLayer):
+        PluggableLayer.register_oot(
+            _decorated_layer_cls=op_cls, name=registration_name
+        )
+    else:
+        CustomOp.register_oot(_decorated_op_cls=op_cls, name=registration_name)
+
 
 def _patch_unquantized_moe_oracle() -> None:
     """
@@ -73,12 +106,30 @@ def register_oot_ops(whitelist: list[str] | None = None) -> None:
     the upstream select_unquantized_moe_backend oracle is monkey-patched
     so it picks native CUDA backends instead of returning (OOT, None).
     """
-    from vllm_fl.utils import (
-        get_oot_blacklist,
-        get_oot_whitelist,
-        is_oot_enabled,
-        use_flaggems_op,
+    from vllm.platforms import current_platform
+    from vllm_fl.utils import get_oot_blacklist, get_oot_whitelist, is_oot_enabled, use_flaggems_op
+
+    # Vendor lifecycle patches are required independently of the generic OOT
+    # allowlist. In particular USE_FLAGGEMS=0 and an empty OOT whitelist must
+    # still install the FL-owned Qwen GDN/attention/MoE providers before model
+    # construction.
+    is_ascend = (
+        current_platform.vendor_name == "ascend"
+        and current_platform.device_type == "npu"
     )
+    if is_ascend:
+        # Patch the factory before importing any Qwen model module.  qwen3_next
+        # binds ``FusedMoE`` in its module globals at import time, so doing this
+        # after apply_ascend_patches() would leave Qwen3.5/3.6 on the upstream
+        # factory even though the package-level symbol had been replaced.
+        _patch_fused_moe_factory()
+        from vllm_fl.dispatch.backends.vendor.ascend.patch import apply_ascend_patches
+
+        apply_ascend_patches()
+    elif current_platform.device_type == "ptpu":
+        from vllm_fl.dispatch.backends.vendor.sunrise.patch import apply_sunrise_patches
+
+        apply_sunrise_patches()
 
     # Check if OOT registration is enabled
     if not is_oot_enabled():
@@ -117,43 +168,24 @@ def register_oot_ops(whitelist: list[str] | None = None) -> None:
             continue
 
         op_cls, registration_name = OOT_OPS[op_name]
-        logger.info(f"Registering oot op: {op_name} as '{registration_name}'")
-        if issubclass(op_cls, PluggableLayer):
-            PluggableLayer.register_oot(
-                _decorated_layer_cls=op_cls, name=registration_name
+        if (
+            is_ascend
+            and registration_name in _ASCEND_VENDOR_OWNED_REGISTRATIONS
+        ):
+            logger.debug(
+                "Skipping generic OOT op '%s': Ascend vendor lifecycle owns '%s'",
+                op_name,
+                registration_name,
             )
-        else:
-            CustomOp.register_oot(_decorated_op_cls=op_cls, name=registration_name)
-            if op_name == "silu_and_mul_with_clamp":
-                # The OOT lookup key is a class name; public controls use the
-                # upstream snake_case name. The replacement accepts both aliases.
-                op_cls.name = op_name
-
-    # Apply platform-specific monkey-patches unconditionally (outside the OOT
-    # registration loop) so they run even when the whitelist is empty or all ops
-    # are excluded. Each patch function is idempotent.
-    from vllm.platforms import current_platform
-
-    # Apply Ascend NPU monkey-patches if running on NPU.
-    # These replace upstream module-level functions (e.g. in qwen3_next) with
-    # Ascend implementations that bypass the CustomOp/dispatch path.
-    if current_platform.device_type == "npu":
-        from vllm_fl.dispatch.backends.vendor.ascend.patch import apply_ascend_patches
-
-        apply_ascend_patches()
-
-    # Apply Sunrise/PTPU monkey-patches if running on PTPU.
-    if current_platform.device_type == "ptpu":
-        from vllm_fl.dispatch.backends.vendor.sunrise.patch import apply_sunrise_patches
-
-        apply_sunrise_patches()
-
-    # Apply GCU monkey-patches (Triton grid limits, etc.).
+            continue
+        logger.info(f"Registering oot op: {op_name} as '{registration_name}'")
+        _register_oot_once(op_cls, registration_name)
+    # Platform patches must not depend on an operator being selected.
+    # Ascend and Sunrise patches already run before the OOT enabled check.
     if getattr(current_platform, "vendor_name", None) in ("gcu", "enflame"):
         from vllm_fl.dispatch.backends.vendor.gcu.patch import apply_gcu_patches
 
         apply_gcu_patches()
-
     # Kunlunxin patches must run even when no OOT operator was selected.
     from vllm_fl.dispatch.config.utils import get_platform_name
 
@@ -163,13 +195,12 @@ def register_oot_ops(whitelist: list[str] | None = None) -> None:
         )
 
         apply_kunlunxin_patches()
-
     # --- FusedMoE monkey-patch (vllm >= 0.24.0) ---
     # FusedMoE is a factory function in vllm 0.24.0+, not a PluggableLayer
     # subclass, so it cannot be registered via CustomOp/PluggableLayer.register_oot.
     # Instead we replace the factory function in the two places vllm imports it
     # from, so all model code transparently gets FusedMoEFL.
-    if "fused_moe" not in (blacklist or []):
+    if not is_ascend and "fused_moe" not in (blacklist or []):
         _patch_fused_moe_factory()
 
 
@@ -178,12 +209,41 @@ def _patch_fused_moe_factory() -> None:
     vllm modules so that model code picks up the FL version automatically."""
     import vllm.model_executor.layers.fused_moe as _fused_moe_pkg
     import vllm.model_executor.layers.fused_moe.layer as _fused_moe_layer
-
-    if getattr(_fused_moe_layer, "FusedMoE", None) is FusedMoEFL:  # noqa F405
-        # Already patched — idempotent.
-        return
+    from vllm.platforms import current_platform
+    from vllm_fl.ops.fused_moe.layer import _OrigFusedMoE
 
     # Patch at the module level so `from vllm...fused_moe import FusedMoE` picks it up.
     _fused_moe_layer.FusedMoE = FusedMoEFL  # noqa F405
-    _fused_moe_pkg.FusedMoE = FusedMoEFL  # noqa F405
+    _fused_moe_pkg.FusedMoE = FusedMoEFL   # noqa F405
+    # Preserve the historic non-Ascend qwen3_next repair. On Ascend, repair
+    # only model-module stale aliases that still bind the exact upstream
+    # factory captured by FL; an explicit caller/custom factory is untouched.
+    # Models may import the factory before platform initialization. Restrict
+    # repair to the model namespace and identity, preserving custom factories.
+    import sys
+
+    module_names = ["vllm.model_executor.models.qwen3_next"]
+    is_ascend = (
+        current_platform.vendor_name == "ascend"
+        and current_platform.device_type == "npu"
+    )
+    if is_ascend:
+        # Scan EVERY already-imported ``vllm`` module, not just
+        # ``vllm.model_executor.models.*``. MiniMax-M3 lives under
+        # ``vllm.models.minimax_m3.nvidia.model`` and imports the factory at
+        # module scope, so a narrower prefix leaves it holding the upstream
+        # ``FusedMoE``: FL's MoE runner then never constructs, its
+        # ``setup_moe_comm_method()`` never registers a transport, and the first
+        # forward context dies with "MoE communication method MC2 is
+        # unregistered". Identity is checked against FL's captured upstream
+        # factory so an explicit caller-supplied factory is never clobbered.
+        module_names = [
+            name for name in tuple(sys.modules) if name.startswith("vllm.")
+        ]
+    for module_name in module_names:
+        qwen_module = sys.modules.get(module_name)
+        if qwen_module is not None and (
+            not is_ascend or qwen_module.__dict__.get("FusedMoE") is _OrigFusedMoE
+        ):
+            qwen_module.FusedMoE = FusedMoEFL  # noqa F405
     logger.info("Monkey-patched FusedMoE factory -> FusedMoEFL")

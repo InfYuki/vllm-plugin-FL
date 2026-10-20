@@ -38,20 +38,21 @@ def register_builtins(registry: OpRegistry) -> None:
     is_avail = backend.is_available
 
     impls = [
-        OpImpl(
-            op_name="topk_softmax",
-            impl_id="vendor.ascend",
-            kind=BackendImplKind.VENDOR,
-            fn=_bind_is_available(backend.topk_softmax, is_avail),
-            vendor="ascend",
-            priority=BackendPriority.VENDOR,
-        ),
         # Activation
         OpImpl(
             op_name="silu_and_mul",
             impl_id="vendor.ascend",
             kind=BackendImplKind.VENDOR,
             fn=_bind_is_available(backend.silu_and_mul, is_avail),
+            vendor="ascend",
+            priority=BackendPriority.VENDOR,
+        ),
+        # Activation (GELU variant; MiniMax-M3 vision tower / projector)
+        OpImpl(
+            op_name="gelu_and_mul",
+            impl_id="vendor.ascend",
+            kind=BackendImplKind.VENDOR,
+            fn=_bind_is_available(backend.gelu_and_mul, is_avail),
             vendor="ascend",
             priority=BackendPriority.VENDOR,
         ),
@@ -82,17 +83,17 @@ def register_builtins(registry: OpRegistry) -> None:
             vendor="ascend",
             priority=BackendPriority.VENDOR,
         ),
-    ]
-
-    for op_name in ("gdn_decode", "gdn_prefill"):
-        impls.append(OpImpl(
-            op_name=op_name,
+        # MoE router: current-v0.24 A2/A3 native softmax top-k.
+        OpImpl(
+            op_name="topk_softmax",
             impl_id="vendor.ascend",
             kind=BackendImplKind.VENDOR,
-            fn=_bind_is_available(getattr(backend, op_name), is_avail),
+            fn=_bind_is_available(backend.topk_softmax, is_avail),
             vendor="ascend",
             priority=BackendPriority.VENDOR,
-        ))
+        ),
+    ]
+
     impls.append(OpImpl(
         op_name="fused_experts",
         impl_id="vendor.ascend",

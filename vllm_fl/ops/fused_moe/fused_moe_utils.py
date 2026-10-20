@@ -77,6 +77,8 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.XPU]
     elif current_platform.is_cpu():
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
+    elif current_platform.device_type == "npu":
+        _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.TRITON]
     return _AVAILABLE_BACKENDS
 
 
@@ -97,17 +99,6 @@ def select_unquantized_moe_backend_oot(
         return UnquantizedMoeBackend.TPU, None
 
     if current_platform.device_type == "npu":
-        parallel = moe_config.moe_parallel_config
-        if (moe_config.is_lora_enabled or parallel.use_ep
-                or parallel.dp_size != 1
-                or parallel.use_batched_activation_format):
-            raise NotImplementedError(
-                "Ascend grouped MoE currently requires non-EP, DP1 without LoRA"
-            )
-        if moe_config.moe_backend not in ("auto", "triton"):
-            raise NotImplementedError("Unsupported explicit Ascend MoE backend")
-        # Reuse the upstream modular weights/workspace/finalization contract;
-        # apply() below dispatches NPU computation to packaged torch_npu ops.
         return UnquantizedMoeBackend.TRITON, TritonExpertsFL
 
     if current_platform.is_out_of_tree() and use_flaggems():
@@ -298,6 +289,10 @@ def _prepare_expert_assignment(
 
 
 class TritonExpertsFL(TritonExperts):
+    @staticmethod
+    def _supports_current_device() -> bool:
+        return current_platform.device_type == "npu" or TritonExperts._supports_current_device()
+
     def apply(
         self,
         output: torch.Tensor,
@@ -317,28 +312,26 @@ class TritonExpertsFL(TritonExperts):
         apply_router_weight_on_input: bool,
     ):
         if current_platform.device_type == "npu":
-            if self._lora_context is not None or self.gemm1_clamp_limit is not None:
-                raise NotImplementedError("Ascend grouped MoE requires ordinary unquantized experts")
-            output.copy_(_fused_experts(
-                hidden_states, w1, w2, topk_weights, topk_ids,
-                activation=activation.value,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                global_num_experts=global_num_experts, expert_map=expert_map,
-                use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
-                use_int8_w8a8=self.quant_config.use_int8_w8a8,
-                use_int8_w8a16=self.quant_config.use_int8_w8a16,
-                use_int4_w4a16=self.quant_config.use_int4_w4a16,
-                per_channel_quant=self.per_act_token_quant,
-                w1_scale=self.w1_scale, w2_scale=self.w2_scale,
-                a1_scale=a1q_scale, a2_scale=a2_scale,
-                block_shape=self.block_shape,
-                w1_bias=self.w1_bias, w2_bias=self.w2_bias,
-            ))
+            if self._lora_context is not None:
+                raise NotImplementedError("Ascend unquantized MoE LoRA is not part of the TP2 BF16 closure")
+            output.copy_(
+                _fused_experts(
+                    hidden_states,
+                    w1,
+                    w2,
+                    topk_weights,
+                    topk_ids,
+                    activation=activation.value,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
+                )
+            )
             return
 
         # vLLM 0.24 routes unquantized MoE through this modular Experts API.
-        # Reuse the Kunlunxin implementation migrated from the known-good
-        # plugin instead of entering the generic Triton two-GEMM pipeline.
+        # Keep Kunlunxin on its vendor implementation rather than the generic
+        # Triton two-GEMM pipeline.
         if (
             self._lora_context is None
             and getattr(current_platform, "vendor_name", None) == "kunlunxin"
@@ -347,32 +340,21 @@ class TritonExpertsFL(TritonExperts):
                 fused_experts_impl as klx_fused_experts_impl,
             )
 
-            output.copy_(
-                klx_fused_experts_impl(
-                    hidden_states,
-                    w1,
-                    w2,
-                    topk_weights,
-                    topk_ids,
-                    inplace=False,
-                    activation=activation.value,
-                    apply_router_weight_on_input=apply_router_weight_on_input,
-                    use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
-                    use_int8_w8a8=self.quant_config.use_int8_w8a8,
-                    use_int8_w8a16=self.quant_config.use_int8_w8a16,
-                    use_int4_w4a16=self.quant_config.use_int4_w4a16,
-                    per_channel_quant=self.per_act_token_quant,
-                    global_num_experts=global_num_experts,
-                    expert_map=expert_map,
-                    w1_scale=self.w1_scale,
-                    w2_scale=self.w2_scale,
-                    a1_scale=a1q_scale,
-                    a2_scale=a2_scale,
-                    block_shape=self.block_shape,
-                    w1_bias=self.w1_bias,
-                    w2_bias=self.w2_bias,
-                )
-            )
+            output.copy_(klx_fused_experts_impl(
+                hidden_states, w1, w2, topk_weights, topk_ids,
+                inplace=False, activation=activation.value,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
+                use_int8_w8a8=self.quant_config.use_int8_w8a8,
+                use_int8_w8a16=self.quant_config.use_int8_w8a16,
+                use_int4_w4a16=self.quant_config.use_int4_w4a16,
+                per_channel_quant=self.per_act_token_quant,
+                global_num_experts=global_num_experts, expert_map=expert_map,
+                w1_scale=self.w1_scale, w2_scale=self.w2_scale,
+                a1_scale=a1q_scale, a2_scale=a2_scale,
+                block_shape=self.block_shape, w1_bias=self.w1_bias,
+                w2_bias=self.w2_bias,
+            ))
             return
 
         # Fast path (no LoRA, NVIDIA only): single fused FlagGems call.

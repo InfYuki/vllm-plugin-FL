@@ -5,6 +5,7 @@ Tests for rotary embedding ops.
 """
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -179,10 +180,18 @@ class TestRotaryEmbeddingFL:
         ):
             yield
 
-    def test_forward_oot_dispatches_correctly(self, mock_parent_init, mock_cached_op):
+    def test_forward_oot_dispatches_correctly(
+        self, mock_parent_init, mock_cached_op, monkeypatch
+    ):
         """Test forward_oot calls dispatch system with correct arguments."""
+        import vllm_fl.ops.rotary_embedding as rotary_module
         from vllm_fl.ops.rotary_embedding import RotaryEmbeddingFL
 
+        # This CPU mock exercises the generic dispatch route. Ascend's direct
+        # NPU path is exercised by the device smoke, not by these CPU tensors.
+        monkeypatch.setattr(
+            rotary_module, "current_platform", SimpleNamespace(device_type="cpu")
+        )
         layer = RotaryEmbeddingFL(
             head_size=64,
             rotary_dim=32,
