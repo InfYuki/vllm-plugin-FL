@@ -5,19 +5,7 @@ Ascend operator implementations.
 https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu_list.md
 """
 
-from .activation import silu_and_mul_ascend
-from .attention import (
-    AscendAttentionBackend,
-    AscendAttentionBackendImpl,
-    AscendAttentionMetadataBuilder,
-    AscendAttentionState,
-    AscendMetadata,
-    AscendMLABackend,
-    is_torch_npu_available,
-)
-from .attention_mask import AttentionMaskBuilder, get_attention_mask_builder
-from .normalization import rms_norm_ascend
-from .rotary import rotary_embedding_ascend
+from importlib import import_module
 
 __all__ = [
     "silu_and_mul_ascend",
@@ -33,3 +21,19 @@ __all__ = [
     "AttentionMaskBuilder",
     "get_attention_mask_builder",
 ]
+
+
+def __getattr__(name):
+    """Preserve exports without loading unrelated device implementations."""
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = {
+        "silu_and_mul_ascend": ".activation",
+        "rms_norm_ascend": ".normalization",
+        "rotary_embedding_ascend": ".rotary",
+        "AttentionMaskBuilder": ".attention.standard_mask",
+        "get_attention_mask_builder": ".attention.standard_mask",
+    }.get(name, ".attention.attention")
+    value = getattr(import_module(module, __name__), name)
+    globals()[name] = value
+    return value

@@ -6,7 +6,6 @@ import torch
 
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
-
 from vllm_fl.dispatch import CachedOp
 
 _rotary_embedding = CachedOp("rotary_embedding")
@@ -35,11 +34,11 @@ class RotaryEmbeddingFL(RotaryEmbedding):
             is_neox_style, dtype
         )
         if current_platform.device_type == "npu":
-            from vllm_fl.dispatch.backends.vendor.ascend.impl.rotary import (
-                initialize_rotary_embedding_ascend,
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.canonical_rotary import (
+                ensure_npu_rotary_embedding_registered,
             )
 
-            initialize_rotary_embedding_ascend()
+            ensure_npu_rotary_embedding_registered()
 
     def forward_oot(
         self,
@@ -53,6 +52,18 @@ class RotaryEmbeddingFL(RotaryEmbedding):
         if current_platform.device_type != "npu" or not torch.compiler.is_compiling():
             self.cos_sin_cache = cos_sin_cache
         positions = positions.flatten()
+
+        if current_platform.device_type == "npu" and key is not None:
+            return torch.ops.vllm.npu_rotary_embedding(
+                positions,
+                query,
+                key,
+                cos_sin_cache,
+                self.head_size,
+                self.rotary_dim,
+                self.is_neox_style,
+            )
+
         num_tokens = positions.shape[0]
 
         query_shape = query.shape

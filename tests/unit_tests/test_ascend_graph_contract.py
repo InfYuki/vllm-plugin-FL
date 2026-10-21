@@ -4,6 +4,7 @@
 import ast
 import importlib.util
 import os
+import re
 import sys
 from contextlib import contextmanager
 from enum import Enum
@@ -16,9 +17,10 @@ ROOT = Path(__file__).resolve().parents[2] / "vllm_fl"
 
 
 def _ascend_phase_helpers():
-    tree = ast.parse(
-        (ROOT / "dispatch/backends/vendor/ascend/impl/attention.py").read_text()
-    )
+    trees = [
+        ast.parse((ROOT / path).read_text())
+        for path in ("dispatch/backends/vendor/ascend/impl/attention/attention.py", "dispatch/backends/vendor/ascend/impl/attention/utils.py")
+    ]
     names = {
         "AscendAttentionState",
         "classify_ascend_attention_state",
@@ -26,16 +28,15 @@ def _ascend_phase_helpers():
     }
     nodes = [
         node
+        for tree in trees
         for node in tree.body
         if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names
     ]
     assert {node.name for node in nodes} == names
     # Keep Python 3.9 CPU CI independent of runtime annotation imports and NPU
     # registration while executing the real enum and function definitions.
-    future = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ImportFrom) and node.module == "__future__"
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
     )
     module = ast.fix_missing_locations(
         ast.Module(body=[future, *nodes], type_ignores=[])
@@ -125,6 +126,7 @@ def test_profile_finally_clears_decoder_once_and_restores_state(with_runtime):
 
     def clear_decoder_graphs():
         wrapper.clear_all_graphs()
+        breakable.clear_all_graphs()
         calls.append("tasks")
 
     dispatcher = NS(cudagraph_keys={"full": {1, 2}}, keys_initialized=True)
@@ -155,10 +157,10 @@ def test_profile_finally_clears_decoder_once_and_restores_state(with_runtime):
         compile(ast.Module(body=cleanup, type_ignores=[]), "profile-finally", "exec"),
         namespace,
     )
-    expected = [False, "decoder"]
+    expected = [False, "decoder", "breakable"]
     if with_runtime:
         expected.append("tasks")
-    assert calls == expected + ["breakable", "encoder", "lora-config", "kv-cache"]
+    assert calls == expected + ["encoder", "lora-config", "kv-cache"]
     assert wrapper_instance.graph_pool == "original-pool"
     assert breakable_instance.graph_pool == "original-breakable-pool"
     assert dispatcher.cudagraph_keys == {"full": set()}
@@ -285,11 +287,15 @@ def _runtime(monkeypatch, calls):
     stream = NS(synchronize=lambda: calls.append("synchronize"))
     platform = NS(
         device_type="npu",
+        dist_backend="hccl",
         torch_device_fn=NS(
             current_stream=lambda: stream, Stream=lambda: "update-stream"
         ),
     )
     _module(monkeypatch, "vllm.platforms", current_platform=platform)
+    _module(
+        monkeypatch, "vllm.config", CUDAGraphMode=NS(), VllmConfig=object
+    )
     _module(monkeypatch, "vllm.distributed.parallel_state", GraphCaptureContext=NS)
     _module(
         monkeypatch,
@@ -302,6 +308,7 @@ def _runtime(monkeypatch, calls):
         "_fl_graph_contract_runtime", ROOT / "compilation/graph_runtime.py"
     )
     module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     return module, platform
 
@@ -310,9 +317,9 @@ def test_capture_replay_orders_updates_after_enqueue(monkeypatch):
     calls = []
     runtime, _ = _runtime(monkeypatch, calls)
     controller = runtime.GraphRuntimeController(vllm_config="config")
-    controller.attention_impls = (
+    controller.set_attention_impls((
         NS(update_graph_params=lambda *a: calls.append("update")),
-    )
+    ))
     context = NS(batch_descriptor=NS(num_tokens=4), capturing=False)
     with controller.capture_scope(context):
         assert context.capturing
@@ -342,13 +349,13 @@ def test_failed_capture_and_replay_restore_state(monkeypatch):
     pytest.raises(
         RuntimeError, fail_in_scope, controller.capture_scope(context), "capture failed"
     ).match("capture failed")
-    assert not context.capturing and not controller._active
+    assert not context.capturing and controller.phase is runtime.GraphPhase.IDLE
     calls.clear()
     pytest.raises(
         RuntimeError, fail_in_scope, controller.replay_scope(context), "replay failed"
     ).match("replay failed")
     assert calls == ["synchronize"]  # Failed enqueue must not release update events.
-    assert not controller._active
+    assert controller.phase is runtime.GraphPhase.IDLE
 
 
 def test_selected_backends_are_bound_once(monkeypatch):
@@ -361,7 +368,7 @@ def test_selected_backends_are_bound_once(monkeypatch):
     controller.bind_attention_groups(
         [[NS(backend=backend), NS(backend=backend)], [NS(backend=base)]]
     )
-    assert controller.attention_impls == (impl,)
+    assert controller._attention_impls == (impl,)
 
 
 def test_graph_cleanup_clears_wrapper_before_task_registry(monkeypatch):
@@ -379,6 +386,7 @@ def test_non_npu_capture_uses_existing_policy(monkeypatch):
     calls = []
     runtime, platform = _runtime(monkeypatch, calls)
     platform.device_type = "gcu"
+    platform.dist_backend = "eccl"
 
     @contextmanager
     def existing_capture(*, device):
@@ -402,13 +410,20 @@ def _configure(monkeypatch, *, breakable=False):
         CompilationMode=compile_modes,
     )
     _module(monkeypatch, "vllm.envs", VLLM_USE_BREAKABLE_CUDAGRAPH=breakable)
+    validator_name = "vllm_fl.compilation.config"
+    validator_spec = importlib.util.spec_from_file_location(
+        validator_name, ROOT / "compilation/config.py"
+    )
+    validator = importlib.util.module_from_spec(validator_spec)
+    monkeypatch.setitem(sys.modules, validator_name, validator)
+    validator_spec.loader.exec_module(validator)
     source = ast.parse((ROOT / "platform.py").read_text())
     helper = next(
         n
         for n in source.body
         if isinstance(n, ast.FunctionDef) and n.name == "_configure_ascend_compilation"
     )
-    namespace = {"os": os}
+    namespace = {"os": os, "logger": NS(info=lambda *args: None)}
     exec(
         compile(ast.Module(body=[helper], type_ignores=[]), "platform-helper", "exec"),
         namespace,
@@ -428,13 +443,19 @@ def _config(enabled=None, *, eager=False):
 
 @pytest.mark.parametrize("eager", [False, True])
 def test_removed_npugraph_feature_rejected_even_in_eager(monkeypatch, eager):
-    with pytest.raises(NotImplementedError, match="enable_npugraph_ex=true"):
+    with pytest.raises(
+        NotImplementedError,
+        match="^FL Ascend FX fusion does not support enable_npugraph_ex=True$",
+    ):
         _configure(monkeypatch)(_config(True, eager=eager))
 
 
 @pytest.mark.parametrize("value", ["false", 0, 1])
 def test_npugraph_flag_requires_boolean(monkeypatch, value):
-    with pytest.raises(TypeError, match="must be bool"):
+    with pytest.raises(
+        TypeError,
+        match=f"^enable_npugraph_ex must be a bool, got {type(value).__name__}$",
+    ):
         _configure(monkeypatch)(_config(value))
 
 
@@ -446,15 +467,63 @@ COMPILER_OPTIONS = (
     "fuse_allreduce_rms",
     "fuse_muls_add",
 )
+RETIRED_COMPILER_OPTIONS = (
+    "enable_npugraph_ex", "enable_static_kernel", "fuse_allreduce_rms"
+)
+SUPPORTED_FUSIONS = ("fuse_norm_quant", "fuse_qknorm_rope", "fuse_muls_add")
 
 
-@pytest.mark.parametrize("name", COMPILER_OPTIONS)
+@pytest.mark.parametrize("name", RETIRED_COMPILER_OPTIONS)
 @pytest.mark.parametrize("eager", [False, True])
 def test_removed_compiler_options_reject_enable(monkeypatch, name, eager):
     config = _config(eager=eager)
     config.additional_config["ascend_compilation_config"] = {name: True}
-    with pytest.raises(NotImplementedError, match=f"{name}=true"):
+    with pytest.raises(
+        NotImplementedError,
+        match=f"^FL Ascend FX fusion does not support {name}=True$",
+    ):
         _configure(monkeypatch)(config)
+
+
+@pytest.mark.parametrize("name", SUPPORTED_FUSIONS)
+@pytest.mark.parametrize("eager", [False, True])
+def test_supported_compiler_fusions_select_vendor_fx(monkeypatch, name, eager):
+    monkeypatch.delenv("ASCEND_LAUNCH_BLOCKING", raising=False)
+    config = _config(eager=eager)
+    options = dict.fromkeys(COMPILER_OPTIONS, False)
+    options[name] = True
+    config.additional_config["ascend_compilation_config"] = options.copy()
+    _configure(monkeypatch)(config)
+    assert config.additional_config["ascend_compilation_config"] == options
+    assert config.compilation_config.backend == "fl_fx_fusion"
+    assert not config.compilation_config.use_inductor
+    assert config.compilation_config.mode == ("none" if eager else "vllm")
+    assert config.compilation_config.cudagraph_mode == ("none" if eager else "decode")
+
+
+def test_default_compiler_fusions_preserved(monkeypatch):
+    monkeypatch.delenv("ASCEND_LAUNCH_BLOCKING", raising=False)
+    config = _config()
+    _configure(monkeypatch)(config)
+    assert config.additional_config["ascend_compilation_config"] == {
+        name: name in SUPPORTED_FUSIONS for name in COMPILER_OPTIONS
+    }
+    assert config.compilation_config.backend == "fl_fx_fusion"
+    assert config.compilation_config.mode == "vllm"
+    assert config.compilation_config.cudagraph_mode == "decode"
+    assert not config.compilation_config.use_inductor
+
+
+def test_minimax_m3_excludes_only_qknorm_rope_fusion(monkeypatch):
+    monkeypatch.delenv("ASCEND_LAUNCH_BLOCKING", raising=False)
+    config = _config()
+    config.model_config.architectures = ["MiniMaxM3ForConditionalGeneration"]
+    _configure(monkeypatch)(config)
+    options = config.additional_config["ascend_compilation_config"]
+    assert not options["fuse_qknorm_rope"]
+    assert options["fuse_norm_quant"] and options["fuse_muls_add"]
+    assert not any(options[name] for name in RETIRED_COMPILER_OPTIONS)
+    assert config.compilation_config.backend == "fl_fx_fusion"
 
 
 @pytest.mark.parametrize("name", COMPILER_OPTIONS)
@@ -463,7 +532,8 @@ def test_compiler_options_require_boolean(monkeypatch, name, value):
     config = _config()
     config.additional_config["ascend_compilation_config"] = {name: value}
     with pytest.raises(
-        TypeError, match=f"ascend_compilation_config.{name} must be bool"
+        TypeError,
+        match=f"^{name} must be a bool, got {type(value).__name__}$",
     ):
         _configure(monkeypatch)(config)
 
@@ -472,7 +542,10 @@ def test_compiler_options_require_boolean(monkeypatch, name, value):
 def test_compiler_config_requires_dict(monkeypatch, value):
     config = _config(eager=True)
     config.additional_config["ascend_compilation_config"] = value
-    with pytest.raises(TypeError, match="ascend_compilation_config must be a dict"):
+    with pytest.raises(
+        TypeError,
+        match=r"^additional_config\.ascend_compilation_config must be a dict$",
+    ):
         _configure(monkeypatch)(config)
 
 
@@ -488,7 +561,10 @@ def test_additional_config_requires_dict(monkeypatch, value):
 def test_unknown_compiler_option_rejected(monkeypatch, value):
     config = _config(eager=True)
     config.additional_config["ascend_compilation_config"] = {"typo_option": value}
-    with pytest.raises(ValueError, match="Unknown ascend_compilation_config option"):
+    with pytest.raises(
+        ValueError,
+        match="^" + re.escape("Unsupported FL Ascend compiler options: ['typo_option']") + "$",
+    ):
         _configure(monkeypatch)(config)
 
 
@@ -509,19 +585,30 @@ def test_breakable_graph_rejected(monkeypatch):
     assert not hasattr(config.compilation_config, "backend")
 
 
-@pytest.mark.parametrize("eager,mode", [(True, "decode"), (False, "none")])
-def test_graph_disabled_allows_breakable_switch(monkeypatch, eager, mode):
-    config = _config(eager=eager)
-    config.compilation_config.cudagraph_mode = mode
+def test_enforce_eager_disables_graph_and_compilation_with_breakable(monkeypatch):
+    config = _config(eager=True)
     _configure(monkeypatch, breakable=True)(config)
     assert config.compilation_config.mode == "none"
     assert config.compilation_config.cudagraph_mode == "none"
+
+
+def test_graph_none_preserves_requested_fx_compilation(monkeypatch):
+    config = _config()
+    config.compilation_config.cudagraph_mode = "none"
+    _configure(monkeypatch, breakable=True)(config)
+    assert config.compilation_config.mode == "vllm"
+    assert config.compilation_config.cudagraph_mode == "none"
+    assert config.compilation_config.backend == "fl_fx_fusion"
+    assert not config.compilation_config.use_inductor
 
 
 @pytest.mark.parametrize("enabled", [None, False])
 def test_full_decode_uses_eager_fx(monkeypatch, enabled):
     monkeypatch.delenv("ASCEND_LAUNCH_BLOCKING", raising=False)
     config = _config(enabled)
+    config.additional_config["ascend_compilation_config"].update(
+        dict.fromkeys(SUPPORTED_FUSIONS, False)
+    )
     _configure(monkeypatch)(config)
     compilation = config.compilation_config
     assert compilation.mode == "vllm" and compilation.backend == "eager"
@@ -564,10 +651,20 @@ def _rotary_class(monkeypatch, device_type, calls):
         calls.append(("dispatch", cos.dtype, interleaved, inplace))
         return query, key
 
+    def native_rotary(positions, query, key, cache, head_size, rotary_dim, neox):
+        calls.append((
+            "native", cache.dtype, head_size, rotary_dim, neox,
+            cache, positions, query, key,
+        ))
+        return query, key
+
+    monkeypatch.setattr(
+        torch.ops.vllm, "npu_rotary_embedding", native_rotary, raising=False
+    )
     _module(
         monkeypatch,
-        "vllm_fl.dispatch.backends.vendor.ascend.impl.rotary",
-        initialize_rotary_embedding_ascend=lambda: calls.append("initialize"),
+        "vllm_fl.dispatch.backends.vendor.ascend.impl.canonical_rotary",
+        ensure_npu_rotary_embedding_registered=lambda: calls.append("initialize"),
     )
     tree = ast.parse((ROOT / "ops/rotary_embedding.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
@@ -601,33 +698,52 @@ def test_rotary_cache_write_and_initialization_contract(
         assert torch.equal(q, query) and torch.equal(k, key)
     assert obj.cache_writes == (0 if device_type == "npu" and compiling else 2)
     assert obj.cos_sin_cache is cache
-    assert calls[-2:] == [("dispatch", torch.float64, False, True)] * 2
+    if device_type == "npu":
+        for call in calls[-2:]:
+            assert call[:5] == ("native", torch.float64, 4, 4, True)
+            assert call[5] is cache
+            assert torch.equal(call[6], torch.tensor([0, 1]))
+            assert call[7] is query and call[8] is key
+    else:
+        assert calls[-2:] == [("dispatch", torch.float64, False, True)] * 2
     assert calls.count("initialize") == (1 if device_type == "npu" else 0)
 
 
-def test_rotary_vendor_initialization_calls_registration_without_kernel(monkeypatch):
+@pytest.mark.parametrize("existing_op", [False, True])
+def test_rotary_canonical_registration_is_lazy_and_idempotent(existing_op):
     calls = []
-    _module(
-        monkeypatch,
-        "torch_npu.op_plugin.atb._atb_ops",
-        _register_atb_extensions=lambda: calls.append("register"),
-    )
+    native, fake = object(), object()
+    ops = NS(npu_rotary_embedding=native) if existing_op else NS()
     tree = ast.parse(
-        (ROOT / "dispatch/backends/vendor/ascend/impl/rotary.py").read_text()
+        (ROOT / "dispatch/backends/vendor/ascend/impl/canonical_rotary.py").read_text()
     )
     helper = next(
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "initialize_rotary_embedding_ascend"
+        and node.name == "ensure_npu_rotary_embedding_registered"
     )
-    namespace = {}
+    namespace = {
+        "torch": NS(ops=NS(vllm=ops)),
+        "_REGISTERED": False,
+        "npu_rotary_embedding": native,
+        "_npu_rotary_embedding_fake": fake,
+        "direct_register_custom_op": lambda **kwargs: calls.append(kwargs),
+    }
     exec(
         compile(ast.Module(body=[helper], type_ignores=[]), "rotary-init", "exec"),
         namespace,
     )
     namespace[helper.name]()
-    assert calls == ["register"]
+    namespace[helper.name]()
+    assert namespace["_REGISTERED"]
+    assert calls == ([] if existing_op else [{
+        "op_name": "npu_rotary_embedding",
+        "op_func": native,
+        "fake_impl": fake,
+        "mutates_args": [],
+        "dispatch_key": "PrivateUse1",
+    }])
 
 
 def test_npu_compiling_consumes_local_converted_cache(monkeypatch):
@@ -643,8 +759,8 @@ def test_npu_compiling_consumes_local_converted_cache(monkeypatch):
         conversions.append(device)
         return converted
 
-    # The stored object deliberately has no chunk method: consuming the old
-    # buffer instead of the converted local reference must fail this contract.
+    # The native provider must receive the converted local buffer, while the
+    # original stored object remains untouched during compilation.
     original = NS(to=convert)
     obj.cos_sin_cache = original
     obj.cache_writes = 0
@@ -653,7 +769,10 @@ def test_npu_compiling_consumes_local_converted_cache(monkeypatch):
     obj.forward_oot(torch.tensor([0, 1]), query, key)
     assert conversions == [torch.device("cpu")]
     assert obj.cos_sin_cache is original and obj.cache_writes == 0
-    assert calls[-1] == ("dispatch", torch.float64, False, True)
+    assert calls[-1][:5] == ("native", torch.float64, 4, 4, True)
+    assert calls[-1][5] is converted
+    assert torch.equal(calls[-1][6], torch.tensor([0, 1]))
+    assert calls[-1][7] is query and calls[-1][8] is key
 
 
 def _memory_hook(monkeypatch, platform, calls):

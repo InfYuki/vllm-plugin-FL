@@ -47,31 +47,43 @@ class AscendBackend(Backend):
         return AscendBackend._available
 
     # ==================== Operator Implementations ====================
-    def gdn_decode(self, *args, **kwargs):
-        from .impl.gdn_reference import gdn_decode
+    def minimax_m3_sparse_kernels(self):
+        from .impl.minimax_m3_sparse import MiniMaxM3SparseKernels
 
-        return gdn_decode(*args, **kwargs)
+        return MiniMaxM3SparseKernels
 
-    def gdn_prefill(self, *args, **kwargs):
-        from .impl.gdn_reference import gdn_prefill
+    def qkv_rmsnorm_rope(self, *args, **kwargs):
+        from .impl.qkv_rmsnorm_rope import qkv_rmsnorm_rope
 
-        return gdn_prefill(*args, **kwargs)
+        return qkv_rmsnorm_rope(*args, **kwargs)
+
+    def qkv_rmsnorm_mrope(self, *args, **kwargs):
+        from .impl.qkv_rmsnorm_rope import qkv_rmsnorm_mrope
+
+        return qkv_rmsnorm_mrope(*args, **kwargs)
+
+    def deepseek_v4_hc_pre(self, *args, **kwargs):
+        from .impl.deepseek_v4_hc import hc_pre_native
+
+        return hc_pre_native(*args, **kwargs)
+
+    def deepseek_v4_hc_post(self, *args, **kwargs):
+        from .impl.deepseek_v4_hc import hc_post_native
+
+        return hc_post_native(*args, **kwargs)
+
+    def is_hc_available(self) -> bool:
+        # Inspect symbols without importing impl's heavy package initializer.
+        namespace = torch.ops._C_ascend
+        return self.is_available() and all(
+            hasattr(namespace, name) for name in ("npu_hc_pre_v2", "npu_hc_post")
+        )
 
     def fused_experts(self, *args, **kwargs):
         """Stable expert-call seam; implementation owns routing and math."""
         from .impl.fused_moe import fused_experts_impl
 
         return fused_experts_impl(*args, **kwargs)
-
-    def topk_softmax(
-        self, topk_weights, topk_ids, token_expert_indices, gating_output,
-        renormalize: bool,
-    ):
-        from .impl.fused_moe import topk_softmax
-
-        return topk_softmax(
-            topk_weights, topk_ids, token_expert_indices, gating_output, renormalize
-        )
 
     def silu_and_mul(self, obj, x: torch.Tensor) -> torch.Tensor:
         """
@@ -87,6 +99,24 @@ class AscendBackend(Backend):
         from .impl.activation import silu_and_mul_ascend
 
         return silu_and_mul_ascend(obj, x)
+
+    def gelu_and_mul(self, obj, x: torch.Tensor) -> torch.Tensor:
+        """
+        GELU activation followed by element-wise multiplication.
+
+        Required by MiniMax-M3's vision tower / multimodal projector; without a
+        vendor implementation the op resolves to the PyTorch reference backend.
+
+        Args:
+            obj: The calling obj (``GeluAndMul``), carrying ``approximate``.
+            x: Input tensor of shape [..., 2*d]
+
+        Returns:
+            Output tensor of shape [..., d]
+        """
+        from .impl.activation import gelu_and_mul_ascend
+
+        return gelu_and_mul_ascend(obj, x)
 
     def rms_norm(
         self,
@@ -149,7 +179,12 @@ class AscendBackend(Backend):
             inplace=inplace,
         )
 
-    def attention_backend(self, use_mla: bool = False, use_sparse: bool = False) -> str:
+    def attention_backend(
+        self,
+        use_mla: bool = False,
+        use_sparse: bool = False,
+        use_compress: bool = False,
+    ) -> str:
         """
         Get the attention backend class path for Ascend NPU.
 
@@ -163,12 +198,42 @@ class AscendBackend(Backend):
         Args:
             use_mla: Whether to use Multi-head Latent Attention (MLA)
             use_sparse: Whether to use Deepseek Sparse Attention (DSA)
+            use_compress: Whether the DeepSeek-V4 compressed DSA cache is in use
 
         Returns:
             Fully qualified class path string
         """
+        # This is the current vLLM-Ascend non-MTP/non-DSA-CP selector
+        # semantic. DSA is distinguished from normal MLA by compression, not
+        # by a model-name special case.
+        if use_mla and not use_sparse and use_compress:
+            return (
+                "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.dsa_v1."
+                "AscendDSABackend"
+            )
         if use_mla:
             if use_sparse:
-                raise NotImplementedError("MLA with sparse attention is not implemented for Ascend yet.")
-            return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendMLABackend"
-        return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.AscendAttentionBackend"
+                from vllm_fl.dispatch.backends.vendor.ascend.attention_selector import get_sfa_backend
+
+                return ".".join(get_sfa_backend().full_cls_name())
+            return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.attention.AscendMLABackend"
+        return "vllm_fl.dispatch.backends.vendor.ascend.impl.attention.attention.AscendAttentionBackend"
+
+    def topk_softmax(
+        self,
+        topk_weights: torch.Tensor,
+        topk_indices: torch.Tensor,
+        token_expert_indices: torch.Tensor,
+        gating_output: torch.Tensor,
+        renormalize: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fill vLLM's preallocated softmax top-k outputs on Ascend."""
+        from .impl.fused_moe import topk_softmax_ascend
+
+        return topk_softmax_ascend(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+        )

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 
 import os
+import weakref
 
 import pytest
 
@@ -19,8 +20,11 @@ def isolated_dispatch(monkeypatch):
     manager._state.init_pid = os.getpid()
 
     reset_global_policy()
-    monkeypatch.setattr(dispatch, "_CACHED_OPS", [])
+    monkeypatch.setattr(dispatch, "_CACHED_OPS", weakref.WeakSet())
     monkeypatch.setattr(dispatch, "_OP_FAST_PATH_ENABLED", True)
+    # Exercise main's general prewarm contract on any test host. Ascend's
+    # stricter protocol has dedicated prewarm and vendor-isolation coverage.
+    monkeypatch.setattr(dispatch, "_requires_compile_prewarm", lambda: False)
     monkeypatch.setattr(dispatch, "get_default_manager", lambda: manager)
     yield manager, registry
     reset_global_policy()

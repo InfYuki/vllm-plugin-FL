@@ -40,10 +40,17 @@ op_backends:
     - flagos
     - vendor
     - reference
+  # gelu_and_mul: MiniMax-M3 vision tower/projector; vendor = torch_npu fused op
+  gelu_and_mul:
+    - vendor
+    - flagos
+    - reference
   rotary_embedding:
     - vendor
     - flagos
     - reference
+  topk_softmax:
+    - vendor:ascend
 
 # FlagOS operator blacklist
 # These operators will NOT use FlagOS implementation even if FlagOS is enabled.
@@ -70,6 +77,8 @@ flagos_blacklist:
   - fill_scalar_
   - sum_dim
   - exponential_
+  # Native exponential_ also calls log_; FlagGems 5.3.4 can produce NaN noise.
+  - log_
   - mm
   - resolve_neg
   - resolve_conj

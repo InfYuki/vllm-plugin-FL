@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter
-from vllm.distributed import divide, get_tp_group, tensor_model_parallel_all_reduce
+from vllm.distributed import divide, get_tp_group
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -35,12 +35,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     pad_vocab_size,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.utils import set_weight_attrs
+from vllm_fl.configs.ascend import get_ascend_config
 
-
-def maybe_pad_and_reduce(x: torch.Tensor,
-                               is_ep_comm: bool = False) -> torch.Tensor:
-    return tensor_model_parallel_all_reduce(x)
 
 class AscendVocabParallelEmbedding(VocabParallelEmbedding):
     """
@@ -190,7 +188,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
-        output = maybe_pad_and_reduce(output_parallel)
+        output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel)
         return output
 
 
@@ -223,3 +221,32 @@ class AscendParallelLMHead(ParallelLMHead):
             })
         else:
             self.register_parameter("bias", None)
+
+
+class AscendLogitsProcessor(LogitsProcessor):
+    """Keep equal, unpadded LM-head TP shards local for reduce-sample.
+
+    Unequal shards (including an original-vocab padding tail) deliberately use
+    the upstream gather.  Candidate offsets are only correct for uniform
+    partitions, so silently treating padding as vocabulary is unsafe.
+    """
+
+    def _get_logits(self, hidden_states, lm_head, embedding_bias=None):
+        logits = lm_head.quant_method.apply(lm_head, hidden_states,
+                                            bias=embedding_bias)
+        reduce_sample = get_ascend_config().enable_reduce_sample
+        uniform = (
+            getattr(lm_head, "tp_size", 1) <= 1
+            or (getattr(lm_head, "num_org_embeddings_per_partition", 0)
+                * lm_head.tp_size == self.org_vocab_size)
+        )
+        # Added LoRA vocabulary and special LM-head layouts have a different
+        # global-ID mapping; retain upstream gather until they are sharded.
+        uniform = uniform and getattr(lm_head, "num_embeddings", self.org_vocab_size) == self.org_vocab_size
+        if not reduce_sample or not uniform:
+            logits = self._gather_logits(logits)
+            if logits is not None:
+                return logits[..., :self.org_vocab_size]
+            return logits
+        # There is no padding in a uniform shard by construction.
+        return logits[..., :lm_head.num_org_embeddings_per_partition]
