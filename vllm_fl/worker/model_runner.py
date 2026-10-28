@@ -2840,6 +2840,12 @@ class ModelRunnerFL(GPUModelRunner):
                 if self.use_async_spec_decode and num_scheduled_tokens is not None:
                     cm_base.seq_lens_cpu = seq_lens_cpu
                     cm_base.num_computed_tokens_cpu = num_computed_tokens_cpu
+        if getattr(self.model_config, "rswa_window", None) is not None:
+            # Retain the complete prompt across prefill chunks and request reorder.
+            # Padded request rows must never inherit a stale prompt length.
+            cm_base.rswa_num_actual_reqs = num_reqs
+            cm_base.rswa_prefix_lens = num_prompt_tokens_cpu.clone()
+            cm_base.rswa_prefix_lens[num_reqs:] = 0
         self._set_ascend_common_attention_state(cm_base, ascend_attn_state)
 
         if self.dcp_world_size > 1:
@@ -4039,6 +4045,19 @@ class ModelRunnerFL(GPUModelRunner):
                 if batch_desc_num_reqs is not None
                 else num_reqs
             )
+
+        if (
+            getattr(self.model_config, "rswa_window", None) is not None
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and self.compilation_config.cudagraph_mode
+            == CUDAGraphMode.FULL_DECODE_ONLY
+            and self.uniform_decode_query_len == 1
+        ):
+            # R-SWA replay copies masks into capture-time buffers. Keep one
+            # request per token in every decode bucket, matching capture B;
+            # merging all padding into one request would change the mask and
+            # block-table shapes (e.g. five real rows plus one dummy vs B=8).
+            num_reqs_padded = num_tokens_padded
 
         if (
             num_tokens_padded
