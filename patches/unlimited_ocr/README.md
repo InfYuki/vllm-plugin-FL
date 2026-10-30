@@ -4,6 +4,8 @@
 
 本补丁包含 native 模型/config/registry、ModelScope alias、32-crop processor、动态图像尺寸、R-SWA metadata/spec、DeepSeek-V2 MHA 接入及 tokenizer ByteLevel 修复。`unlimited-ocr` 已加入错误 tokenizer_class 的白名单，避免模型配置中的 Llama 类覆盖 tokenizer.json 的原生编码解码图。历史 tokenizer 增量已合并，不能再次叠加。
 
+`max_crops` 默认为 32。服务端或请求级覆盖时，占位 token 计数使用实际已解析 processor 的 crop 上限；profiling 的最大特征尺寸也使用同一配置，不再固定为 4×8 裁图。
+
 本次移植仅完成静态/CPU 检查，尚无 NPU 验证；历史设备环境和指标不代表本次重建代码通过设备验收。
 
 ## 检查、应用与验证
@@ -16,6 +18,8 @@ python3 patches/unlimited_ocr/apply_vllm_patch.py /path/to/vllm
 ```
 
 工具严格检查 vLLM 基线提交，并依据 `manifest.json` 校验修改前后的 SHA256。遇到基线或文件哈希不匹配时，应先查明源码差异，不能强制覆盖现有修改。补丁只改变 Python 源码，不升级依赖或安装模型。运行环境必须实际加载该目录中的 core，例如通过既有 editable 安装和启动脚本的 `VLLM_SOURCE_DIR`。
+
+如果已经应用旧版 backport，升级前先停止使用该 core 的服务，并使用旧版工具、manifest 和 patch 执行 `--reverse`；随后再用新版工具执行 `--check` 和应用。新版工具不会自动覆盖旧版已应用状态。
 
 OCR 来源版本的历史验证环境为 Python 3.12.13、Torch 2.10.0+cpu、torch-npu 2.10.0.post2、Transformers 5.13.0、torchvision 0.25.0+cpu、CANN/ATB 9.0.1。已有编译扩展只有在 ABI 一致时才可复用；新环境需依照各仓库正常流程构建和安装原生扩展。模型权重、数据集、第三方 evaluator 和二进制不随补丁提供。
 

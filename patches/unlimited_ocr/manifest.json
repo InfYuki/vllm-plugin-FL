@@ -5,7 +5,7 @@
     {
       "path": "vllm/model_executor/models/unlimited_ocr.py",
       "before_sha256": null,
-      "after_sha256": "dec93dd2efd8ac294bab1866c299b910be1adc80dbd590029620cbb045b26c37"
+      "after_sha256": "2e27b2bc2c4b4de317b34eb1973f3942aa685a9f675542cd23e55f3c4520007c"
     },
     {
       "path": "vllm/transformers_utils/configs/unlimited_ocr.py",
@@ -93,6 +93,6 @@
       "after_sha256": "2ffc101eb44a05ebd9482d32a4afb0fcc1d3796ce9286dcee8ca2f4029176258"
     }
   ],
-  "patch_sha256": "34fa0faaaae1dda14e8a22c7f4389088b39e73af22ee0fd6635353ba89e083b9",
+  "patch_sha256": "e2d0a7dc54240268751a3f2fc8d2c6823e5c6ee260164319bcae3b4847941a1c",
   "ocr_source_commit": "d4f94d5e30773e85fd8a1c43349bae07c7d02a77"
 }

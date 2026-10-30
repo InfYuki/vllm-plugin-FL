@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/vllm/model_executor/models/unlimited_ocr.py
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,261 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inference-only Unlimited-OCR model compatible with HuggingFace weights.
@@ -127,15 +127,17 @@
 +    def get_num_image_tokens(
 +        self, *, image_width: int, image_height: int, cropping: bool | None = None,
 +        image_size: int | None = None, base_size: int | None = None,
++        max_crops: int | None = None,
 +    ) -> int:
 +        patch_size = 16
 +        downsample_ratio = 4
 +        if cropping is None:
 +            cropping = bool(self.ctx.get_merged_mm_kwargs({}).get("crop_mode", CROP_MODE))
-+        if image_size is None or base_size is None:
++        if image_size is None or base_size is None or max_crops is None:
 +            processor = self.get_hf_processor()
 +            image_size = processor.image_size if image_size is None else image_size
 +            base_size = processor.base_size if base_size is None else base_size
++            max_crops = processor.max_crops if max_crops is None else max_crops
 +
 +        # Honour the caller-supplied `cropping` flag: multi-image callers pass
 +        # cropping=False to match UnlimitedOCRProcessor.tokenize_with_images.
@@ -146,7 +148,7 @@
 +                crop_ratio = count_tiles(
 +                    image_width,
 +                    image_height,
-+                    max_num=_UNLIMITED_OCR_MAX_CROPS,
++                    max_num=max_crops,
 +                    image_size=image_size,
 +                )
 +            num_width_tiles, num_height_tiles = crop_ratio
@@ -169,10 +171,12 @@
 +        cropping = self.ctx.get_merged_mm_kwargs({}).get("crop_mode", CROP_MODE)
 +        if not cropping:
 +            return ImageSize(width=processor.image_size, height=processor.image_size)
-+        # With max_crops=32, the widest possible grid is 4×8 (aspect ratio 1:2).
-+        # A 2560×5120 image (4×640 × 8×640) selects exactly 4×8=32 tiles and
-+        # produces the maximum token count.
-+        return ImageSize(width=processor.image_size * 4, height=processor.image_size * 8)
++        # A 1xN grid uses the crop limit and maximizes row-separator tokens.
++        # Caps below two fall back to the single global view in the processor.
++        return ImageSize(
++            width=processor.image_size,
++            height=processor.image_size * max(1, processor.max_crops),
++        )
 +
 +
 +class UnlimitedOCRMultiModalProcessor(DeepseekOCRMultiModalProcessor):
@@ -223,6 +227,7 @@
 +                    cropping=effective_cropping,
 +                    image_size=hf_processor.image_size,
 +                    base_size=hf_processor.base_size,
++                    max_crops=hf_processor.max_crops,
 +                )
 +            return [image_token_id] * num_image_tokens
 +
