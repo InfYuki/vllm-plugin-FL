@@ -6,6 +6,8 @@
 
 `max_crops` 默认为 32。服务端或请求级覆盖时，占位 token 计数使用实际已解析 processor 的 crop 上限；profiling 的最大特征尺寸也使用同一配置，不再固定为 4×8 裁图。
 
+平台校验要求 Ascend NPU：FL 使用 `vendor_name=ascend` 和 `device_type=npu`；原生 vLLM-Ascend 使用 NPU 与 `ASCEND_RT_VISIBLE_DEVICES` 平台标识。其他 OOT vendor 会在配置阶段被拒绝，OOT 本身不代表支持 R-SWA。
+
 本次移植仅完成静态/CPU 检查，尚无 NPU 验证；历史设备环境和指标不代表本次重建代码通过设备验收。
 
 ## 检查、应用与验证

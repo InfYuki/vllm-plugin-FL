@@ -85,7 +85,7 @@
     {
       "path": "vllm/model_executor/models/config.py",
       "before_sha256": "6f812bebdd0ffdd82bfe237971efd6614cfa22197e345c63e86a5564bc6f1333",
-      "after_sha256": "6f0de3ca68873c3b3ce3728f67b68d1f661159537b8de1c027a63e105207a25b"
+      "after_sha256": "2cfe98c7d6ae30108c123b5a6b832ea2a9366f91471f8f39a1cfaa94f781b743"
     },
     {
       "path": "vllm/tokenizers/registry.py",
@@ -93,6 +93,6 @@
       "after_sha256": "2ffc101eb44a05ebd9482d32a4afb0fcc1d3796ce9286dcee8ca2f4029176258"
     }
   ],
-  "patch_sha256": "e2d0a7dc54240268751a3f2fc8d2c6823e5c6ee260164319bcae3b4847941a1c",
+  "patch_sha256": "ce4d52ad5f481e3b355646e22e7e3bc6e08a48bfb6f173c38f51e82efba02840",
   "ocr_source_commit": "d4f94d5e30773e85fd8a1c43349bae07c7d02a77"
 }

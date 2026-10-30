@@ -647,7 +647,7 @@
          self,
 --- a/vllm/model_executor/models/config.py
 +++ b/vllm/model_executor/models/config.py
-@@ -45,6 +45,32 @@
+@@ -45,6 +45,44 @@
          # Ernie4.5-VL conditionally executes text/vision MoE branches, so
          # fast_moe_cold_start can silently produce incorrect execution order.
          vllm_config.compilation_config.fast_moe_cold_start = False
@@ -660,7 +660,19 @@
 +        # this 0.24 backport do not implement R-SWA masks.
 +        from vllm.platforms import current_platform
 +
-+        if not current_platform.is_out_of_tree():
++        # FL exposes vendor_name; native vLLM-Ascend identifies its NPU
++        # platform through the Ascend device-control contract instead.
++        vendor = getattr(current_platform, "vendor_name", None)
++        is_ascend = vendor == "ascend" or (
++            vendor is None
++            and getattr(current_platform, "device_control_env_var", None)
++            == "ASCEND_RT_VISIBLE_DEVICES"
++        )
++        if not (
++            current_platform.is_out_of_tree()
++            and current_platform.device_type == "npu"
++            and is_ascend
++        ):
 +            raise ValueError("Unlimited-OCR 0.24 backport requires the Ascend R-SWA backend")
 +        if vllm_config.cache_config.enable_prefix_caching:
 +            vllm_config.cache_config.enable_prefix_caching = False
@@ -680,7 +692,7 @@
  
  
  class Gemma3TextModelConfig(VerifyAndUpdateConfig):
-@@ -669,6 +695,7 @@
+@@ -669,6 +707,7 @@
  
  
  MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
