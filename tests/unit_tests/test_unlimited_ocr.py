@@ -19,6 +19,9 @@ from vllm_fl.dispatch.backends.reference.register_ops import (
 from vllm_fl.dispatch.backends.vendor.ascend.impl.attention_mask import (
     AttentionMaskBuilder,
 )
+from vllm_fl.dispatch.backends.vendor.ascend.impl.ocr_kv_cache import (
+    expand_head_major_slots,
+)
 from vllm_fl.dispatch.backends.vendor.ascend.register_ops import (
     register_builtins as register_ascend,
 )
@@ -49,6 +52,23 @@ def test_rswa_mask_matches_scalar_positions(monkeypatch, limit):
     torch.testing.assert_close(
         actual, _reference_rswa_mask(prefix, seq, query, 17, 5, 3)
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_ocr_head_major_slots_preserve_pages_and_skip_padding(dtype):
+    pages, heads, block = 4, 10, 128
+    logical = torch.tensor([3 * block + 1, -1, 0, block - 1, -1, block], dtype=dtype)
+    slots = expand_head_major_slots(logical, heads, block).reshape(-1, heads)
+    assert slots.dtype == torch.int32
+    addresses = torch.arange(pages * heads * block, dtype=torch.int32).reshape(
+        pages, heads, block
+    )
+    for row, slot in enumerate(logical.tolist()):
+        if slot >= 0:
+            page, offset = divmod(slot, block)
+            torch.testing.assert_close(slots[row], addresses[page, :, offset])
+    padding = slots[logical < 0]
+    assert (padding < 0).all() and padding.unique().numel() == padding.numel()
 
 
 @pytest.fixture

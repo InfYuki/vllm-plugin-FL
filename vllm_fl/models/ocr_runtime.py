@@ -28,6 +28,24 @@ def get_ocr_rswa_window(model_config) -> int | None:
     return getattr(model_config.hf_config, "rswa_window", None)
 
 
+def ocr_head_major_kv_enabled(config) -> bool:
+    if not is_unlimited_ocr(config.model_config):
+        return False
+    value = os.environ.get("VLLM_FL_OCR_HEAD_MAJOR_KV", "0")
+    if value not in ("0", "1"):
+        raise ValueError("VLLM_FL_OCR_HEAD_MAJOR_KV must be 0 or 1")
+    if value == "0":
+        return False
+    if (
+        config.parallel_config.tensor_parallel_size != 1
+        or config.model_config.dtype != torch.bfloat16
+        or config.cache_config.cache_dtype not in ("auto", "bfloat16")
+        or getattr(getattr(config, "kv_transfer_config", None), "kv_connector", None)
+    ):
+        raise ValueError("Head-major OCR KV requires TP1 with a local BF16 cache")
+    return True
+
+
 def ocr_prefill_top6_binding():
     """Resolve the optional operator before the first live forward."""
     enabled = os.environ.get("VLLM_FL_OCR_PREFILL_MOE_TOP6", "0")
@@ -128,6 +146,7 @@ def validate_ocr_config(config, *, device_type, vendor):
         or config.lora_config is not None
     ):
         raise ValueError("Unlimited-OCR supports ordinary TP1 or TP2 without LoRA")
+    ocr_head_major_kv_enabled(config)
     if config.scheduler_config.async_scheduling:
         raise ValueError("Unlimited-OCR requires synchronous scheduling")
     mode = config.compilation_config.cudagraph_mode

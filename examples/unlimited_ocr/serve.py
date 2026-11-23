@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--max-num-seqs", type=int, default=64)
     parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
     parser.add_argument("--rswa-mask-mib", type=int, default=2048)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.80)
     parser.add_argument("--eager", action="store_true")
     args = parser.parse_args()
 
@@ -90,7 +91,7 @@ def main():
         f"--max-num-batched-tokens={budget}",
         "--enable-chunked-prefill",
         "--no-async-scheduling",
-        "--gpu-memory-utilization=0.80",
+        f"--gpu-memory-utilization={args.gpu_memory_utilization}",
         "--no-enable-prefix-caching",
         f"--chat-template={CHAT_TEMPLATE}",
         "--mm-processor-cache-gb=0",

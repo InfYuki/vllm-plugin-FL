@@ -34,7 +34,12 @@ from typing import Any, ClassVar, List, Optional, Tuple, Type
 import torch
 import torch.nn as nn
 
-from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode,
+    VllmConfig,
+    get_current_vllm_config,
+    get_current_vllm_config_or_none,
+)
 from vllm.forward_context import get_forward_context
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
@@ -50,10 +55,15 @@ from vllm.v1.attention.backends.registry import (
     register_backend,
 )
 
-from vllm_fl.models.ocr_runtime import get_ocr_rswa_window, is_unlimited_ocr
+from vllm_fl.models.ocr_runtime import (
+    get_ocr_rswa_window,
+    is_unlimited_ocr,
+    ocr_head_major_kv_enabled,
+)
 
 from ..rswa_graph import RswaGraphBuffers
 from .attention_mask import AttentionMaskBuilder
+from .ocr_kv_cache import expand_head_major_slots, write_head_major_kv
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +324,7 @@ class FusedInferAttentionGraphParam:
     pre_tokens: int
     next_tokens: int
     rswa_slot_mapping: torch.Tensor | None = None
+    ocr_kv_pool: torch.Tensor | None = None
 
 
 @dataclass
@@ -347,6 +358,7 @@ class AscendMetadata:
 
     causal: bool = True
     model_runner_type: str = ""
+    ocr_head_major_kv: bool = False
 
 
 
@@ -369,6 +381,16 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.device = device
+        self.ocr_head_major_kv = ocr_head_major_kv_enabled(vllm_config)
+        if self.ocr_head_major_kv and kv_cache_spec is not None:
+            logger.info(
+                "FL Unlimited-OCR selected head-major BF16 KV for %d decoder layers "
+                "with physical [K/V, page, head, token, dim] shape [2, pages, %d, %d, %d]",
+                len(layer_names),
+                kv_cache_spec.num_kv_heads,
+                kv_cache_spec.block_size,
+                kv_cache_spec.head_size,
+            )
         self._mask_builder = AttentionMaskBuilder(
             device, ocr_mode=is_unlimited_ocr(self.model_config)
         )
@@ -589,6 +611,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             model_runner_type=self.model_config.runner_type,
             rswa_window=rswa_window,
             rswa_groups=rswa_groups,
+            ocr_head_major_kv=self.ocr_head_major_kv,
         )
 
     def _split_decodes_and_prefills(self, common_attn_metadata):
@@ -687,6 +710,19 @@ class AscendAttentionBackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> Tuple[int, ...]:
         return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        config = get_current_vllm_config_or_none()
+        if config is not None and ocr_head_major_kv_enabled(config):
+            # The runner exposes [K/V, page, token, head, dim] views of
+            # [K/V, page, head, token, dim] storage. Page IDs stay unchanged.
+            if include_num_layers_dimension:
+                return (0, 1, 2, 4, 3, 5)
+            return (0, 1, 3, 2, 4)
+        return AttentionBackend.get_kv_cache_stride_order(include_num_layers_dimension)
 
     @staticmethod
     def swap_blocks(
@@ -795,6 +831,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if not isinstance(metadata, dict) or not metadata:
             raise RuntimeError("R-SWA graphs require one shared decode metadata group")
         live = next(iter(metadata.values()))
+        head_major_kv = getattr(live, "ocr_head_major_kv", False)
         if any(other is not live for other in metadata.values()):
             raise RuntimeError("R-SWA graphs require one shared decode metadata group")
         if (
@@ -836,10 +873,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
             or slots.dtype not in (torch.int32, torch.int64)
             or slots.device != buffers.block_table.device
             or not slots.is_contiguous()
+            or (head_major_kv and live.num_actual_tokens != num_tokens)
         ):
             raise RuntimeError("R-SWA graph requires the runner's fixed slot mapping")
 
         if getattr(forward_context, "capturing", False):
+            if head_major_kv:
+                # Recompute from the runner's slots inside the captured model.
+                # An eager warmup may have already used this context.
+                forward_context.ocr_head_major_slots = None
             # A reduced model length may use a narrower, contiguous view of
             # the original reservation. Replay uses the exact views captured here.
             mask = buffers.attn_mask.view(-1)[: live.attn_mask.numel()].view_as(
@@ -871,6 +913,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 or slots.data_ptr() != captured_slots.data_ptr()
             ):
                 raise RuntimeError("R-SWA graph slot mapping changed address or dtype")
+            if (captured[0].ocr_kv_pool is not None) != head_major_kv:
+                raise RuntimeError("R-SWA graph KV layout changed since capture")
+            if head_major_kv and any(
+                forward_context.no_compile_layers[param.layer_name].kv_cache
+                is not param.ocr_kv_pool
+                for param in captured
+            ):
+                raise RuntimeError(
+                    "Head-major OCR KV pool was rebound after graph capture"
+                )
 
         # Validate both inputs before mutating either of them or enqueuing replay.
         for captured, current, label in (
@@ -1007,31 +1059,67 @@ class AscendAttentionBackendImpl(AttentionImpl):
         """Get parameters for fused_infer_attention."""
 
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
-            block_size = 128
-            block_table = None
-            actual_seq_lengths_kv = attn_metadata.actual_seq_lengths_q
-        elif attn_metadata.attn_state == AscendAttentionState.PrefillCacheHit:
-            batch_size = attn_metadata.seq_lens.shape[0]
-            block_table = attn_metadata.block_tables[:batch_size, :]
-            num_block, block_size, _, _ = self.key_cache.shape
-            key = self.key_cache.view(num_block, block_size, -1)
-            value = self.value_cache.view(num_block, block_size, -1)
-            actual_seq_lengths_kv = attn_metadata.seq_lens_list
-        elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-            num_block, block_size, _, _ = self.key_cache.shape
-            key = self.key_cache.view(num_block, block_size, -1)
-            value = self.value_cache.view(num_block, block_size, -1)
-            block_table = attn_metadata.block_tables
-            actual_seq_lengths_kv = attn_metadata.seq_lens_list
-        else:
-            # ChunkedPrefill
-            num_block, block_size, _, _ = self.key_cache.shape
-            key = self.key_cache.view(num_block, block_size, -1)
-            value = self.value_cache.view(num_block, block_size, -1)
-            block_table = attn_metadata.block_tables
-            actual_seq_lengths_kv = attn_metadata.seq_lens_list
+            return key, value, 128, None, attn_metadata.actual_seq_lengths_q
 
-        return key, value, block_size, block_table, actual_seq_lengths_kv
+        block_table = attn_metadata.block_tables
+        if attn_metadata.attn_state == AscendAttentionState.PrefillCacheHit:
+            block_table = block_table[:attn_metadata.seq_lens.shape[0], :]
+        if getattr(attn_metadata, "ocr_head_major_kv", False):
+            # Paged TND FIA accepts contiguous [page, head, block, dim].
+            block_size = key.shape[2]
+        else:
+            num_block, block_size, _, _ = self.key_cache.shape
+            key = self.key_cache.view(num_block, block_size, -1)
+            value = self.value_cache.view(num_block, block_size, -1)
+
+        return key, value, block_size, block_table, attn_metadata.seq_lens_list
+
+    def _prepare_ocr_head_major_kv(
+        self,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        kv_cache: torch.Tensor | tuple[torch.Tensor, ...],
+        attn_metadata: AscendMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write current rows, then select raw prompt K/V or paged FIA views."""
+        if self.attn_type != AttentionType.DECODER or attn_metadata.rswa_window is None:
+            raise ValueError("Head-major OCR KV requires R-SWA decoder attention")
+        key_cache = kv_cache[0].transpose(1, 2)
+        value_cache = kv_cache[1].transpose(1, 2)
+        if (
+            key_cache.shape[1:] != (self.num_kv_heads, 128, self.head_size)
+            or value_cache.shape != key_cache.shape
+            or key_cache.dtype != torch.bfloat16
+            or value_cache.dtype != key_cache.dtype
+            or value_cache.device != key_cache.device
+            or not key_cache.is_contiguous()
+            or not value_cache.is_contiguous()
+        ):
+            raise ValueError(
+                "Expected contiguous BF16 [page, head, 128, dim] OCR KV storage"
+            )
+
+        raw_prefill = attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+        if key is None or value is None:
+            if key is None and value is None and not raw_prefill:
+                return key_cache, value_cache
+            raise ValueError("OCR attention requires paired K/V projections")
+        count = attn_metadata.num_actual_tokens
+        key = key[:count].contiguous()
+        value = value[:count].contiguous()
+        # All layers in this group consume the same logical slots. Build
+        # their physical indices once per forward, after dummy padding.
+        context = get_forward_context()
+        cached = getattr(context, "ocr_head_major_slots", None)
+        if cached is None or cached[0] is not attn_metadata:
+            slots = expand_head_major_slots(
+                attn_metadata.slot_mapping[:count], self.num_kv_heads, key_cache.shape[2]
+            )
+            context.ocr_head_major_slots = (attn_metadata, slots)
+        else:
+            slots = cached[1]
+        write_head_major_kv(key, value, key_cache, value_cache, slots)
+        return (key, value) if raw_prefill else (key_cache, value_cache)
 
     def reshape_and_cache(
         self,
@@ -1241,12 +1329,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         event.wait(stream)
         event.reset(stream)
         graph_params.events[num_tokens].append(event)
+        head_major_kv = getattr(attn_metadata, "ocr_head_major_kv", False)
         graph_params.attn_params[num_tokens].append(
             FusedInferAttentionGraphParam(
                 layer_name=layer_name,
                 query=self._weak_ref_tensor(query),
-                key=self._weak_ref_tensor(key),
-                value=self._weak_ref_tensor(value),
+                # Keep the exact head-major views (including V's storage offset)
+                # for task updates. The runner owns the underlying allocation.
+                key=key if head_major_kv else self._weak_ref_tensor(key),
+                value=value if head_major_kv else self._weak_ref_tensor(value),
                 block_table=block_table
                 if is_rswa
                 else self._weak_ref_tensor(block_table),
@@ -1263,6 +1354,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 pre_tokens=pre_tokens,
                 next_tokens=next_tokens,
                 rswa_slot_mapping=attn_metadata.slot_mapping if is_rswa else None,
+                ocr_kv_pool=layer.kv_cache if head_major_kv else None,
             )
         )
         torch.npu.graph_task_group_begin(stream)
@@ -1496,13 +1588,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if attn_metadata is None:
             return output.fill_(0)
 
-        # Reshape and cache KV
-        if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
-            kv_cache = [i.contiguous() for i in kv_cache]
-        if key is not None and value is not None:
-            key = key.contiguous()
-            value = value.contiguous()
-            key, value = self.reshape_and_cache(key, value, kv_cache, attn_metadata)
+        if getattr(attn_metadata, "ocr_head_major_kv", False):
+            key, value = self._prepare_ocr_head_major_kv(
+                key, value, kv_cache, attn_metadata
+            )
+        else:
+            if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+                kv_cache = [i.contiguous() for i in kv_cache]
+            if key is not None and value is not None:
+                key = key.contiguous()
+                value = value.contiguous()
+                key, value = self.reshape_and_cache(key, value, kv_cache, attn_metadata)
 
         # Handle pooling model branch (encoder attention)
         if attn_metadata.model_runner_type == "pooling":
@@ -1581,17 +1677,18 @@ def reserve_rswa_graph_buffers(
     mask = torch.empty((max_tokens, 1, 1, max_kv), dtype=torch.int8, device=device)
     table = torch.empty((max_tokens, max_blocks), dtype=torch.int32, device=device)
     workspace = None
+    head_major_kv = ocr_head_major_kv_enabled(config)
     for num_heads, num_kv_heads, head_size, scale in layouts:
         # The vendor query examines tensor descriptors and the host sequence
         # lengths. A single context's pages suffice, with no live KV allocation.
         query = torch.empty(
             (max_tokens, num_heads, head_size), dtype=dtype, device=device
         )
-        pages = torch.empty(
-            (max_blocks, block_size, num_kv_heads * head_size),
-            dtype=dtype,
-            device=device,
-        )
+        if head_major_kv:
+            page_shape = (max_blocks, num_kv_heads, block_size, head_size)
+        else:
+            page_shape = (max_blocks, block_size, num_kv_heads * head_size)
+        pages = torch.empty(page_shape, dtype=dtype, device=device)
         for size in sorted(capture_sizes, reverse=True):
             sized = workspace_api(
                 query=query[:size],

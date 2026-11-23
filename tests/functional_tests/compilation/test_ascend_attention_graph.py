@@ -143,9 +143,8 @@ def test_attention_graph_updates_mixed_backends(order):
 _CAPTURE_SIZES = [1, 2, 4, 8, 16, 32, 64]
 _MAX_LENGTH = 32768
 _BLOCK_SIZE = 128
-_LOCAL_HEADS = 5
+_TOTAL_HEADS = 10
 _HEAD_DIM = 128
-_WINDOW = 64
 _DTYPE = torch.bfloat16
 
 
@@ -166,22 +165,23 @@ def tp_group():
         initialize_model_parallel,
     )
 
+    world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(local_rank)
     config = VllmConfig(
         parallel_config=ParallelConfig(
-            tensor_parallel_size=2, disable_custom_all_reduce=True
+            tensor_parallel_size=world_size, disable_custom_all_reduce=True
         ),
         compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
     )
     with set_current_vllm_config(config):
         init_distributed_environment(
-            world_size=2,
+            world_size=world_size,
             rank=int(os.environ["RANK"]),
             local_rank=local_rank,
             backend="hccl",
         )
-        initialize_model_parallel(2, backend="hccl")
+        initialize_model_parallel(world_size, backend="hccl")
         try:
             yield get_tp_group()
         finally:
@@ -189,27 +189,42 @@ def tp_group():
             destroy_distributed_environment()
 
 
-def _cache_metadata(bucket, real_requests, step):
+def _cache_metadata(bucket, real_requests, step, *, disjoint=False):
     max_pages = _MAX_LENGTH // _BLOCK_SIZE
     lengths = torch.zeros(bucket, dtype=torch.int32)
     prefixes = torch.zeros_like(lengths)
     table = torch.zeros((bucket, max_pages), dtype=torch.int32)
     slots = torch.full((bucket,), -1, dtype=torch.int64)
     sequence_lengths = (1, 128, 129, 259, 513, 32768)
+    prefix = 129 + step % 31
+    if disjoint:
+        prefix = 128
+        sequence_lengths = (127, 128, 129, 255, 256, 257, 1152)
+        history = 1 + torch.randperm(
+            max_pages - 1, generator=torch.Generator().manual_seed(step)
+        )
+        history_start = 0
     for row in range(real_requests):
         length = sequence_lengths[(step + row) % len(sequence_lengths)]
         lengths[row] = length
-        prefixes[row] = min(129 + step % 31, length) if row % 3 else 0
+        prefixes[row] = min(prefix, length) if row % 3 else 0
         page_count = (length + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-        shared = torch.arange(1, max_pages, dtype=torch.int32).roll(step + row)
-        table[row, : page_count - 1] = shared[: page_count - 1]
+        past_pages = page_count - 1
+        if disjoint:
+            table[row, :past_pages] = history[
+                history_start : history_start + past_pages
+            ]
+            history_start += past_pages
+        else:
+            shared = torch.arange(1, max_pages, dtype=torch.int32).roll(step + row)
+            table[row, :past_pages] = shared[:past_pages]
         final_page = max_pages + (row + step) % bucket
         table[row, page_count - 1] = final_page
         slots[row] = final_page * _BLOCK_SIZE + (length - 1) % _BLOCK_SIZE
     return lengths, prefixes, table, slots
 
 
-def _reference(query, updates, initial_cache, lengths, prefixes, paged, slots):
+def _reference(query, updates, initial_cache, lengths, prefixes, paged, slots, window):
     """Apply token writes on CPU, then gather the permitted keys by position."""
     key_cache, value_cache = (tensor.clone() for tensor in initial_cache)
     keys, values = updates
@@ -223,7 +238,7 @@ def _reference(query, updates, initial_cache, lengths, prefixes, paged, slots):
     for row, length in enumerate(lengths.tolist()):
         if not length:
             continue
-        tail = max(length - _WINDOW, 0)
+        tail = max(length - window, 0)
         positions = torch.cat(
             (torch.arange(min(int(prefixes[row]), tail)), torch.arange(tail, length))
         )
@@ -237,11 +252,12 @@ def _reference(query, updates, initial_cache, lengths, prefixes, paged, slots):
 
 
 @pytest.mark.skipif(
-    int(os.environ.get("WORLD_SIZE", "1")) != 2,
-    reason="Requires two NPU processes launched with torchrun",
+    os.environ.get("WORLD_SIZE") not in {"1", "2"}
+    or not {"RANK", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"}.issubset(os.environ),
+    reason="Requires one or two NPU processes launched with torchrun",
 )
 @torch.inference_mode()
-def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
+def test_ocr_full_decode_updates_paged_rswa_graph(tp_group, monkeypatch):
     from vllm.compilation.monitor import set_cudagraph_capturing_enabled
     from vllm.config import CUDAGraphMode, set_current_vllm_config
     from vllm.forward_context import (
@@ -250,6 +266,8 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
         override_forward_context,
     )
     from vllm.v1.attention.backend import AttentionType
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
 
     from vllm_fl.compilation.graph import GraphWrapper
     from vllm_fl.dispatch.backends.vendor.ascend.impl.attention import (
@@ -260,6 +278,11 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
 
     device = torch.device("npu", torch.npu.current_device())
     rank = tp_group.rank_in_group
+    world_size = tp_group.world_size
+    head_major = world_size == 1
+    local_heads = _TOTAL_HEADS // world_size
+    window = 128 if head_major else 64
+    monkeypatch.setenv("VLLM_FL_OCR_HEAD_MAJOR_KV", "1" if head_major else "0")
     layer_name = "model.layers.0.self_attn.attn"
     config = SimpleNamespace(
         compilation_config=SimpleNamespace(
@@ -269,7 +292,7 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
             static_forward_context={},
         ),
         parallel_config=SimpleNamespace(
-            tensor_parallel_size=2,
+            tensor_parallel_size=world_size,
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
         ),
@@ -277,7 +300,7 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
             hf_config=SimpleNamespace(
                 model_type="unlimited-ocr",
                 architectures=["UnlimitedOCRForCausalLM"],
-                rswa_window=_WINDOW,
+                rswa_window=window,
             ),
             max_model_len=_MAX_LENGTH,
             dtype=_DTYPE,
@@ -287,6 +310,7 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
         scheduler_config=SimpleNamespace(
             max_num_seqs=max(_CAPTURE_SIZES), enable_chunked_prefill=True
         ),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
         additional_config={},
         speculative_config=None,
         quant_config=None,
@@ -294,10 +318,10 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
     backend = AscendAttentionBackend
     with set_current_vllm_config(config):
         impl = backend.get_impl_cls()(
-            _LOCAL_HEADS,
+            local_heads,
             _HEAD_DIM,
             _HEAD_DIM**-0.5,
-            _LOCAL_HEADS,
+            local_heads,
             alibi_slopes=None,
             sliding_window=None,
             kv_cache_dtype="auto",
@@ -309,23 +333,56 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
         layer_name=layer_name, impl=impl, _k_scale_float=1.0, _v_scale_float=1.0
     )
     config.compilation_config.static_forward_context[layer_name] = layer
-    builder = backend.get_builder_cls()(None, [layer_name], config, device)
+    spec = FullAttentionSpec(
+        block_size=_BLOCK_SIZE,
+        num_kv_heads=local_heads,
+        head_size=_HEAD_DIM,
+        dtype=_DTYPE,
+    )
+    builder = backend.get_builder_cls()(spec, [layer_name], config, device)
     runtime = RswaGraphRuntime(vllm_config=config, full_graph_wrapper_type=GraphWrapper)
     assert runtime.reserve_graph_memory(device) > 0
     runtime.bind_attention_groups([[SimpleNamespace(backend=backend)]])
 
     pages = _MAX_LENGTH // _BLOCK_SIZE + max(_CAPTURE_SIZES)
-    initial_cache = tuple(
+    page_shape = (
+        (pages, local_heads, _BLOCK_SIZE, _HEAD_DIM)
+        if head_major
+        else (pages, _BLOCK_SIZE, local_heads, _HEAD_DIM)
+    )
+    initial_banks = tuple(
         torch.randn(
-            (pages, _BLOCK_SIZE, _LOCAL_HEADS, _HEAD_DIM),
+            page_shape,
             generator=torch.Generator().manual_seed(181 + 2 * rank + i),
             dtype=_DTYPE,
         )
         for i in range(2)
     )
-    kv_cache = tuple(tensor.to(device) for tensor in initial_cache)
+    if head_major:
+        raw = torch.empty(pages * spec.page_size_bytes, dtype=torch.int8, device=device)
+        logical_shape = backend.get_kv_cache_shape(
+            pages, _BLOCK_SIZE, local_heads, _HEAD_DIM
+        )
+        with set_current_vllm_config(config):
+            order = backend.get_kv_cache_stride_order()
+        kv_cache = _reshape_attention_kv_cache(
+            raw, spec, logical_shape, order, pages, None
+        )
+        assert kv_cache.shape == (2, pages, _BLOCK_SIZE, local_heads, _HEAD_DIM)
+        assert kv_cache.data_ptr() == raw.data_ptr() and kv_cache.nbytes == raw.nbytes
+        physical_banks = raw.view(_DTYPE).view(2, *page_shape)
+        initial_cache = tuple(bank.transpose(1, 2) for bank in initial_banks)
+        for i, view in enumerate(kv_cache):
+            bank = view.transpose(1, 2)
+            assert bank.shape == page_shape and bank.is_contiguous()
+            assert bank.data_ptr() == physical_banks[i].data_ptr()
+            physical_banks[i].copy_(initial_banks[i])
+    else:
+        initial_cache = initial_banks
+        kv_cache = physical_banks = tuple(bank.to(device) for bank in initial_banks)
+    layer.kv_cache = kv_cache
     outputs = {
-        size: torch.empty((size, _LOCAL_HEADS, _HEAD_DIM), device=device, dtype=_DTYPE)
+        size: torch.empty((size, local_heads, _HEAD_DIM), device=device, dtype=_DTYPE)
         for size in _CAPTURE_SIZES
     }
     slot_mappings = {
@@ -338,7 +395,7 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
 
         live = get_forward_context().attn_metadata[layer_name]
         output = impl.forward(
-            layer, query, key, value, kv_cache, live, outputs[query.shape[0]]
+            layer, query, key, value, layer.kv_cache, live, outputs[query.shape[0]]
         )
         return tp_group.all_reduce(output)
 
@@ -399,10 +456,27 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
             set_cudagraph_capturing_enabled(False)
 
         assert len(wrapper.concrete_graph_entries) == len(_CAPTURE_SIZES)
-        for step, bucket in enumerate([*_CAPTURE_SIZES, 4, 64, 1], start=1):
-            real_requests = max(1, bucket - step % 4)
+        if head_major:
+            # Capture ran entirely with negative slots. Both banks must still
+            # match all the original bytes, including page zero.
+            for bank, original in zip(physical_banks, initial_banks):
+                torch.testing.assert_close(bank.cpu(), original, rtol=0, atol=0)
+            assert runtime._params is not None
+            assert set(runtime._params.attn_params) == set(_CAPTURE_SIZES)
+            for (param,) in runtime._params.attn_params.values():
+                assert param.ocr_kv_pool is layer.kv_cache
+                for view, bank in zip((param.key, param.value), physical_banks):
+                    assert view.is_contiguous() and view.shape == bank.shape
+                    assert view.data_ptr() == bank.data_ptr()
+        cases = [
+            (bucket, max(1, bucket - step % 4), False)
+            for step, bucket in enumerate([*_CAPTURE_SIZES, 4, 64, 1], start=1)
+        ]
+        if head_major:
+            cases.extend((64, live, True) for live in (64, 44, 43))
+        for step, (bucket, real_requests, disjoint) in enumerate(cases, start=1):
             lengths, prefixes, table, slots = _cache_metadata(
-                bucket, real_requests, step
+                bucket, real_requests, step, disjoint=disjoint
             )
             live = metadata(bucket, real_requests, lengths, prefixes, table, slots)
             generator = torch.Generator().manual_seed(226 + step + rank * 31)
@@ -412,7 +486,7 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
             )
             for buffer, value in zip(inputs[bucket], fresh):
                 buffer.copy_(value)
-            for cache, original in zip(kv_cache, initial_cache):
+            for cache, original in zip(physical_banks, initial_banks):
                 cache.copy_(original)
             outputs[bucket].fill_(float("nan"))
             results[bucket].fill_(float("nan"))
@@ -426,14 +500,27 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
                         inputs[bucket],
                     )
                 assert torch.isnan(outputs[bucket]).all().item()
+                if head_major:
+                    with monkeypatch.context() as patch:
+                        patch.setattr(layer, "kv_cache", kv_cache.view_as(kv_cache))
+                        with pytest.raises(RuntimeError, match="KV pool was rebound"):
+                            run(live, inputs[bucket])
+                    assert torch.isnan(outputs[bucket]).all().item()
 
             expected, expected_cache = _reference(
-                fresh[0], fresh[1:], initial_cache, lengths, prefixes, table, slots
+                fresh[0],
+                fresh[1:],
+                initial_cache,
+                lengths,
+                prefixes,
+                table,
+                slots,
+                window,
             )
-            # BF16 rounding precedes the collective, which uses HCCL in the graph
-            # and the independent CPU process group for the expected result.
+            # TP2 rounds to BF16 before HCCL. Its reference uses the CPU group.
             expected = expected.to(_DTYPE).float()
-            torch.distributed.all_reduce(expected, group=tp_group.cpu_group)
+            if world_size > 1:
+                torch.distributed.all_reduce(expected, group=tp_group.cpu_group)
             result = run(live, inputs[bucket])
             torch.npu.synchronize()
             torch.testing.assert_close(
@@ -442,7 +529,9 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group):
                 rtol=0.02,
                 atol=0.02,
             )
-            for cache, reference in zip(kv_cache, expected_cache):
+            for cache, reference in zip(physical_banks, expected_cache):
+                if head_major:
+                    reference = reference.transpose(1, 2)
                 torch.testing.assert_close(cache.cpu(), reference, rtol=0, atol=0)
             if real_requests < bucket:
                 assert live.attn_mask[real_requests:].all().item()

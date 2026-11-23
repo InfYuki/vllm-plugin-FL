@@ -253,6 +253,16 @@ R-SWA retains the full KV cache and uses a 2,048 MiB mask budget per rank.
 Prefix caching and speculative decoding are disabled. For single-device
 eager serving, use `--devices 0 --tp 1 --eager --max-num-seqs 4`.
 
+For the TP1 BF16 KV-cache experiment, `bash run_server.sh candidate` (port
+19690) enables `VLLM_FL_OCR_HEAD_MAJOR_KV=1`. Each decoder layer writes into
+its paged K/V allocation in `[page, head, token, dim]` order. Paged attention
+reads the same storage through the existing block table. Choose
+`bash run_server.sh baseline` (port 19691) for the original layout. Both
+commands select causal prefill, prefill MoE Top-6 and 0.95 device-memory
+utilization. Restart between modes and benchmark on the same device with
+`bash run_perf.sh 4096 candidate` or `bash run_perf.sh 4096 baseline`.
+The benchmark also accepts 1024 and 16384 text tokens.
+
 To route the SiLU-and-multiply activation through the official FlagGems package,
 set `USE_FLAGGEMS=1 VLLM_FL_FLAGOS_WHITELIST=silu_and_mul` when launching the
 example. This selects the FL `default.flagos` activation and keeps R-SWA, RoPE
