@@ -73,6 +73,14 @@ class AscendBackend(Backend):
             topk_weights, topk_ids, token_expert_indices, gating_output, renormalize
         )
 
+    def softmax_topk_unbiased(self, logits: torch.Tensor, k: int):
+        import torch_npu
+
+        weights, ids, _ = torch_npu.npu_moe_gating_top_k_softmax_v2(
+            logits, k=k, renorm=0, output_softmax=False
+        )
+        return weights.float(), ids
+
     def silu_and_mul(self, obj, x: torch.Tensor) -> torch.Tensor:
         """
         SiLU activation followed by element-wise multiplication.

@@ -68,6 +68,19 @@ def register_builtins(registry: OpRegistry) -> None:
             vendor="ascend",
             priority=BackendPriority.VENDOR,
         ),
+        OpImpl(
+            op_name="softmax_topk_unbiased",
+            impl_id="vendor.ascend",
+            kind=BackendImplKind.VENDOR,
+            fn=_bind_is_available(
+                backend.softmax_topk_unbiased,
+                lambda: is_avail() and has_npu_operator(
+                    "npu_moe_gating_top_k_softmax_v2", "k", "renorm", "output_softmax"
+                ),
+            ),
+            vendor="ascend",
+            priority=BackendPriority.VENDOR,
+        ),
         # Activation
         OpImpl(
             op_name="silu_and_mul",

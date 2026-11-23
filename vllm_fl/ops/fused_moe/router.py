@@ -5,6 +5,7 @@ import torch
 from functools import partial
 
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
     rocm_aiter_grouped_topk,
 )
@@ -122,6 +123,20 @@ def _fl_grouped_topk(
         else:
             raise ValueError(f"Unsupported scoring function: {scoring_func}")
         return topk_values, topk_indices
+
+    if (
+        gating_output.shape == (1024, 64)
+        and gating_output.device.type in ("npu", "privateuseone")
+        and gating_output.dtype in (torch.bfloat16, torch.float32)
+        and gating_output.is_contiguous()
+        and scoring_func == "softmax" and topk == 6
+        and num_expert_group == topk_group == 1
+        and not renormalize and routed_scaling_factor == 1.0
+        and is_forward_context_available()
+    ):
+        fused = get_forward_context().additional_kwargs.get("ocr_prefill_top6")
+        if fused is not None:
+            return fused(gating_output, topk)
 
     # Fallback: no e_score_correction_bias, use pure-torch path
     if scoring_func == "softmax":

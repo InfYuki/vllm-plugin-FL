@@ -28,6 +28,22 @@ def get_ocr_rswa_window(model_config) -> int | None:
     return getattr(model_config.hf_config, "rswa_window", None)
 
 
+def ocr_prefill_top6_binding():
+    """Resolve the optional operator before the first live forward."""
+    enabled = os.environ.get("VLLM_FL_OCR_PREFILL_MOE_TOP6", "0")
+    if enabled not in ("0", "1"):
+        raise ValueError("VLLM_FL_OCR_PREFILL_MOE_TOP6 must be 0 or 1")
+    if enabled == "0":
+        return None
+
+    from vllm_fl.dispatch import get_default_manager
+    from vllm_fl.dispatch.binding import OperatorBinding
+
+    binding = OperatorBinding(get_default_manager(), "softmax_topk_unbiased")
+    binding.preflight()
+    return binding
+
+
 def _ocr_flaggems_silu() -> bool:
     from vllm_fl.utils import get_flag_gems_whitelist_blacklist, use_flaggems
 

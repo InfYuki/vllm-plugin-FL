@@ -122,6 +122,7 @@ class RswaAttentionGroup:
     token_end: int
     actual_seq_lengths_q: list[int]
     attn_mask: torch.Tensor
+    prompt_causal: bool = False
 
 
 def _build_grouped_rswa_masks(
@@ -133,11 +134,12 @@ def _build_grouped_rswa_masks(
     num_decode_tokens,
     max_kv_len,
     rswa_window,
+    allow_prompt_causal=False,
 ):
-    """Group only ordered, unpadded mixed batches; never allocate the full mask."""
+    """Build masks for contiguous decode and paged prefill request groups."""
     lengths = query_lens.tolist()
     count = len(lengths)
-    if not 0 < num_decodes < count:
+    if not 0 <= num_decodes < count or (num_decodes == 0 and not allow_prompt_causal):
         return None
     if (
         any(q != 1 for q in lengths[:num_decodes])
@@ -147,22 +149,44 @@ def _build_grouped_rswa_masks(
         return None
     if prefix_lens.numel() != count or seq_lens.numel() != count:
         return None
+    # While L <= P every valid past key belongs to the original prompt.
+    # Validate on host metadata; do not synchronize an accelerator tensor.
+    prompt_causal = (
+        allow_prompt_causal
+        and prefix_lens.device.type == seq_lens.device.type == "cpu"
+        and all(
+            q <= length <= prefix <= max_kv_len
+            for q, length, prefix in zip(
+                lengths[num_decodes:],
+                seq_lens[num_decodes:].tolist(),
+                prefix_lens[num_decodes:].tolist(),
+            )
+        )
+    )
+    if not num_decodes and not prompt_causal:
+        return None
     groups = []
     token_start = 0
     for start, end in ((0, num_decodes), (num_decodes, count)):
+        if start == end:
+            continue
         cumulative = list(accumulate(lengths[start:end]))
         token_end = token_start + cumulative[-1]
-        mask = builder.get_rswa_attn_mask(
-            prefix_lens=prefix_lens[start:end],
-            seq_lens=seq_lens[start:end],
-            query_lens=query_lens[start:end],
-            max_kv_len=max_kv_len,
-            max_query_len=max(lengths[start:end]),
-            rswa_window=rswa_window,
-        )
+        causal = prompt_causal and start == num_decodes
+        if causal:
+            mask = builder.get_splitfuse_attn_mask()
+        else:
+            mask = builder.get_rswa_attn_mask(
+                prefix_lens=prefix_lens[start:end],
+                seq_lens=seq_lens[start:end],
+                query_lens=query_lens[start:end],
+                max_kv_len=max_kv_len,
+                max_query_len=max(lengths[start:end]),
+                rswa_window=rswa_window,
+            )
         groups.append(
             RswaAttentionGroup(
-                start, end, token_start, token_end, cumulative, mask
+                start, end, token_start, token_end, cumulative, mask, causal
             )
         )
         token_start = token_end
@@ -494,6 +518,9 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             grouped = os.environ.get("VLLM_FL_RSWA_GROUPED_MASK", "1")
             if grouped not in ("0", "1"):
                 raise ValueError("VLLM_FL_RSWA_GROUPED_MASK must be 0 or 1")
+            causal_prefill = os.environ.get("VLLM_FL_RSWA_CAUSAL_PREFILL", "1")
+            if causal_prefill not in ("0", "1"):
+                raise ValueError("VLLM_FL_RSWA_CAUSAL_PREFILL must be 0 or 1")
             if (
                 grouped == "1"
                 and attn_state == AscendAttentionState.ChunkedPrefill
@@ -512,9 +539,21 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                     num_decode_tokens,
                     max_kv_len,
                     rswa_window,
+                    allow_prompt_causal=(
+                        causal_prefill == "1"
+                        and num_actual_reqs == num_reqs_fia
+                        and block_table is not None
+                    ),
                 )
             if rswa_groups is not None:
                 attn_mask = None
+                if rswa_groups[-1].prompt_causal and not getattr(
+                    self, "_rswa_causal_logged", False
+                ):
+                    logger.info(
+                        "FL R-SWA prompt prefill using right-down causal FIA (sparse_mode=3)"
+                    )
+                    self._rswa_causal_logged = True
                 if not getattr(self, "_rswa_grouped_logged", False):
                     logger.info(
                         "FL R-SWA grouped mask active: decode_requests=%s, prefill_requests=%s",
@@ -1081,12 +1120,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 requests = slice(group.request_start, group.request_end)
                 tokens = slice(group.token_start, group.token_end)
                 fia_args["atten_mask"] = group.attn_mask
+                group_args = fia_args
+                if group.prompt_causal:
+                    group_args = dict(fia_args, sparse_mode=3)
+                    del group_args["pre_tokens"], group_args["next_tokens"]
                 result, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query[tokens],
                     block_table=block_table[requests].contiguous(),
                     actual_seq_lengths=group.actual_seq_lengths_q,
                     actual_seq_lengths_kv=actual_seq_lengths_kv[requests],
-                    **fia_args,
+                    **group_args,
                 )
                 output[tokens] = result.view(-1, self.num_heads, self.head_size)
         else:

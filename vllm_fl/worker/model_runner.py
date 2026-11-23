@@ -55,6 +55,7 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.weight_transfer.base import SparseWeightPatch
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -537,9 +538,14 @@ class ModelRunnerFL(
 
             self.use_ascend_hybrid_cache = uses_dense_hybrid_cache(model_config)
         self._ascend_attn_state = None
-        from vllm_fl.models.ocr_runtime import get_ocr_rswa_window
+        from vllm_fl.models.ocr_runtime import get_ocr_rswa_window, ocr_prefill_top6_binding
 
         self.ocr_rswa_window = get_ocr_rswa_window(self.model_config)
+        self.ocr_prefill_top6 = (
+            ocr_prefill_top6_binding()
+            if self.ocr_rswa_window is not None and self.use_ascend_attention
+            and self.parallel_config.tensor_parallel_size == 1 else None
+        )
         self.graph_runtime = None
         if self.use_ascend_attention:
             from vllm_fl.compilation.graph_runtime import GraphRuntimeController
@@ -4629,6 +4635,16 @@ class ModelRunnerFL(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            # Only the measured, unpadded 1024-token live prefill/mixed step.
+            # Decode, speculative steps, graph capture and dummy runs stay unchanged.
+            if (
+                self.ocr_prefill_top6 is not None
+                and cudagraph_mode == CUDAGraphMode.NONE
+                and self.speculative_config is None
+                and max_num_scheduled_tokens > 1
+                and num_tokens_unpadded == num_tokens_padded == 1024
+            ):
+                get_forward_context().additional_kwargs["ocr_prefill_top6"] = self.ocr_prefill_top6
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
