@@ -3,14 +3,17 @@ set -euo pipefail
 cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
 n=${1:-16384}
+mode=${2:-candidate}
+usage='Usage: bash run_perf.sh [1024|4096|16384] [candidate|baseline] (both use a 2048-token budget)'
+if (( $# > 2 )); then echo "$usage" >&2; exit 2; fi
 case "$n" in
   1024|4096|16384) ;;
-  *) echo 'Input length must be 1024, 4096 or 16384' >&2; exit 2 ;;
+  *) echo "$usage" >&2; exit 2 ;;
 esac
-case "${2:-2048}" in
-  2048|candidate) budget=2048; default_port=19692 ;;
-  1024|baseline)  budget=1024; default_port=19693 ;;
-  *) echo 'Usage: bash run_perf.sh [1024|4096|16384] [2048|1024]' >&2; exit 2 ;;
+case "$mode" in
+  candidate) default_port=19698 ;;
+  baseline)  default_port=19699 ;;
+  *) echo "$usage" >&2; exit 2 ;;
 esac
 port=${PORT:-$default_port}
 base_url=${BASE_URL:-http://127.0.0.1:$port}
@@ -18,10 +21,10 @@ base_url=${base_url%/}
 
 export PYTHONPATH="$PWD:/vllm-workspace/vllm:/workspace/benchmark-deps/.venv/lib/python3.12/site-packages${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
-out="/workspace/results/tp1-prefill-budget-$budget-input-$n-$(date +%Y%m%d-%H%M%S)-$$"
+out="/workspace/results/tp1-expert-layout-$mode-input-$n-$(date +%Y%m%d-%H%M%S)-$$"
 curl -fsS "$base_url/v1/models" | python -c 'import json, sys; sys.exit(0 if any(m["id"] == "Unlimited-OCR" for m in json.load(sys.stdin)["data"]) else "Unlimited-OCR model was not found")'
 mkdir -p "$out"
-printf 'budget=%s endpoint=%s input=%s results=%s\n' "$budget" "$base_url" "$n" "$out"
+printf 'mode=%s budget=2048 endpoint=%s input=%s results=%s\n' "$mode" "$base_url" "$n" "$out"
 python -m evalscope.cli.cli perf \
   --model Unlimited-OCR --url "$base_url/v1/chat/completions" --api openai --api-key EMPTY \
   --dataset random_vl --tokenizer-path /workspace/results/candidate-16384/tokenizer_export \

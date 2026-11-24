@@ -35,6 +35,12 @@ class UnquantizedFusedMoEMethodFL(UnquantizedFusedMoEMethod):
             )
         )
 
+    def process_weights_after_loading(self, layer):
+        super().process_weights_after_loading(layer)
+        prepack = getattr(self, "ocr_expert_prepack", None)
+        if prepack is not None:
+            prepack(layer)
+
     @property
     def is_monolithic(self) -> bool:
         if self.moe_kernel is None:

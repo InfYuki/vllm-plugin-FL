@@ -2,14 +2,18 @@
 set -euo pipefail
 cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
-case "${1:-2048}" in
-  2048|candidate) budget=2048; default_port=19692 ;;
-  1024|baseline)  budget=1024; default_port=19693 ;;
-  *) echo 'Usage: bash run_server.sh [2048|1024]' >&2; exit 2 ;;
+mode=${1:-candidate}
+usage='Usage: bash run_server.sh [candidate|baseline] (both use a 2048-token budget)'
+if (( $# > 1 )); then echo "$usage" >&2; exit 2; fi
+case "$mode" in
+  candidate) expert_prepack=1; default_port=19698 ;;
+  baseline)  expert_prepack=0; default_port=19699 ;;
+  *) echo "$usage" >&2; exit 2 ;;
 esac
 port=${PORT:-$default_port}
 devices=${DEVICES:-0}
 seqs=64
+budget=2048
 mask_mib=4096
 
 export PYTHONPATH="$PWD:/vllm-workspace/vllm:/workspace/benchmark-deps/.venv/lib/python3.12/site-packages${PYTHONPATH:+:$PYTHONPATH}"
@@ -17,6 +21,7 @@ export USE_FLAGGEMS=0 VLLM_FL_VENDOR=ascend VLLM_PLUGINS=fl VLLM_FL_PREFER_ENABL
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export VLLM_FL_RSWA_GROUPED_MASK=1 VLLM_FL_RSWA_CAUSAL_PREFILL=1
 export VLLM_FL_OCR_PREFILL_MOE_TOP6=1 VLLM_FL_OCR_HEAD_MAJOR_KV=1
+export VLLM_FL_OCR_EXPERT_PREPACK=$expert_prepack
 
 python -P - <<'PY'
 from importlib.util import find_spec
@@ -27,8 +32,8 @@ expected = Path.cwd() / "vllm_fl" / "__init__.py"
 if spec is None or not spec.origin or Path(spec.origin).resolve() != expected:
     raise SystemExit(f"Expected FL at {expected}. Python resolved {spec!r}")
 PY
-printf 'FL=%s TP=1 device=%s port=%s seqs=%s max_num_batched_tokens=%s mask_MiB=%s causal_prefill=1 moe_top6=1 head_major_kv=1 memory=0.95\n' \
-  "$PWD" "$devices" "$port" "$seqs" "$budget" "$mask_mib"
+printf 'FL=%s mode=%s TP=1 device=%s port=%s seqs=%s max_num_batched_tokens=%s mask_MiB=%s causal_prefill=1 moe_top6=1 head_major_kv=1 expert_prepack=%s memory=0.95\n' \
+  "$PWD" "$mode" "$devices" "$port" "$seqs" "$budget" "$mask_mib" "$expert_prepack"
 exec python examples/unlimited_ocr/serve.py /public-flash/models/q4_models/Unlimited-OCR \
   --devices "$devices" --tp 1 --port "$port" \
   --max-num-seqs "$seqs" --max-num-batched-tokens "$budget" --rswa-mask-mib "$mask_mib" \

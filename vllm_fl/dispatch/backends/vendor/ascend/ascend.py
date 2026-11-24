@@ -57,6 +57,11 @@ class AscendBackend(Backend):
 
         return gdn_prefill(*args, **kwargs)
 
+    def ocr_expert_prepack(self, layer):
+        from .impl.fused_moe import prepack_ocr_expert_weights
+
+        prepack_ocr_expert_weights(layer)
+
     def fused_experts(self, *args, **kwargs):
         """Stable expert-call seam; implementation owns routing and math."""
         from .impl.fused_moe import fused_experts_impl

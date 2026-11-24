@@ -4,11 +4,56 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 import torch_npu
+
+
+_FRACTAL_NZ = 29
+_OCR_EXPERT_SHAPES = ((64, 1792, 1280), (64, 1280, 896))
+
+
+@torch.no_grad()
+def prepack_ocr_expert_weights(layer):
+    """Keep checkpoint axes for loaders and expose contiguous NZ views to GMM."""
+    weights = (layer.w13_weight, layer.w2_weight)
+    for weight, shape in zip(weights, _OCR_EXPERT_SHAPES):
+        if (weight.shape != shape or weight.dtype != torch.bfloat16
+                or weight.device.type not in ("npu", "privateuseone")):
+            raise ValueError("OCR expert prepack requires TP1 BF16 NPU expert weights")
+
+    gmm_views = [weight.transpose(1, 2) for weight in weights]
+    # A reload writes checkpoint slices through the existing parameters.
+    # Keep graph-captured addresses when those already have the packed layout.
+    if all(view.is_contiguous() and torch_npu.get_npu_format(view) == _FRACTAL_NZ
+           for view in gmm_views):
+        return
+    # The torch_npu 2.10 property is write-only. Preserve even the unset
+    # option ("") instead of guessing its device-dependent effective default.
+    option = "ALLOW_INTERNAL_FORMAT"
+    previous = torch_npu._C._npu_getOption(option)
+    if previous not in (b"", b"disable", b"enable"):
+        raise RuntimeError(f"Unknown {option} value: {previous!r}")
+    try:
+        torch.npu.config.allow_internal_format = True
+        packed = [torch_npu.npu_format_cast(view.contiguous(), _FRACTAL_NZ)
+                  for view in gmm_views]
+    finally:
+        torch.npu.set_option({option: previous.decode("ascii")})
+        if torch_npu._C._npu_getOption(option) != previous:
+            raise RuntimeError(f"Failed to restore {option}")
+
+    checkpoint_views = [weight.transpose(1, 2) for weight in packed]
+    for weight in checkpoint_views:
+        view = weight.transpose(1, 2)
+        if not view.is_contiguous() or torch_npu.get_npu_format(view) != _FRACTAL_NZ:
+            raise RuntimeError("OCR expert GMM view did not retain FRACTAL_NZ")
+    for weight, view in zip(weights, checkpoint_views):
+        weight.data = view
+    logging.getLogger(__name__).info("OCR expert prepack FRACTAL_NZ=29 w13 and w2")
 
 
 def topk_softmax(topk_weights, topk_ids, token_expert_indices, gating_output, renormalize):
@@ -81,7 +126,7 @@ def _torch_fused_experts_impl(
     )
     group_list = expert_tokens.to(torch.int64)
     # vLLM retains [E, N, K] weights. GMM expects [E, K, N]; match
-    # current rc1 moe_mlp.py's need_trans path without rewriting parameters.
+    # the baseline strided view or recover the load-time contiguous NZ view.
     gate_up = torch_npu.npu_grouped_matmul(
         x=[routed], weight=[w1.transpose(1, 2)], split_item=2,
         group_list_type=1, group_type=0, group_list=group_list,
@@ -165,8 +210,15 @@ def fused_experts_impl(
 
     assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
-    assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
-    assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
+    for weight, shape in zip((w1, w2), _OCR_EXPERT_SHAPES):
+        if weight.stride(-1) != 1:
+            # The loader verified format 29. Only inspect shape and strides
+            # here so graph tracing never needs a vendor format query.
+            _, n, k = shape
+            assert (weight.dtype == torch.bfloat16 and weight.shape == shape
+                    and weight.stride() == (n * k, 1, n)), (
+                "Expected OCR expert weights with contiguous GMM axes"
+            )
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
 
     # All expert routing, computation and reduction stay on the device.

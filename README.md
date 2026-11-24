@@ -406,3 +406,19 @@ If you want to use the original CUDA operators, you can set the following enviro
 ```sh
 export USE_FLAGGEMS=0
 ```
+
+## Unlimited-OCR TP1 expert prepack comparison
+
+Use the same Ascend device for both runs, one server at a time. Both modes use the C4 configuration (TP1, 64 sequences, a 2048-token batch budget and MTP disabled). The candidate sets `VLLM_FL_OCR_EXPERT_PREPACK=1` on port 19698. The baseline sets it to 0 on port 19699.
+
+Start the baseline from this checkout, then run the client in a second terminal in the same checkout after the model is ready.
+
+```bash
+bash run_server.sh baseline
+```
+
+```bash
+for n in 1024 4096 16384; do bash run_perf.sh "$n" baseline || break; done
+```
+
+Stop the baseline, start `bash run_server.sh candidate`, and repeat the client loop with `candidate`. Each client run writes its own directory under `/workspace/results/tp1-expert-layout-<mode>-input-<length>-<timestamp>-<pid>`. Both modes use seed 42, concurrency 64 and 1024 output tokens. Compare successful request counts, output throughput, TTFT and TPOT at each length. Check identical greedy outputs on fixed prompts before interpreting timing differences.

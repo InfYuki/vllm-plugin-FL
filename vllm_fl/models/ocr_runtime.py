@@ -146,6 +146,21 @@ def validate_ocr_config(config, *, device_type, vendor):
         or config.lora_config is not None
     ):
         raise ValueError("Unlimited-OCR supports ordinary TP1 or TP2 without LoRA")
+    prepack = os.environ.get("VLLM_FL_OCR_EXPERT_PREPACK", "0")
+    if prepack not in ("0", "1"):
+        raise ValueError("VLLM_FL_OCR_EXPERT_PREPACK must be 0 or 1")
+    if prepack == "1":
+        if parallel.tensor_parallel_size != 1:
+            raise ValueError("OCR expert prepack requires TP1")
+        # additional_config participates in VllmConfig.compute_hash().
+        extra = getattr(config, "additional_config", None)
+        if extra is not None and not isinstance(extra, dict):
+            raise TypeError("OCR expert prepack requires a dict additional_config")
+        config.additional_config = {**(extra or {}), "ocr_expert_prepack": True}
+    else:
+        extra = getattr(config, "additional_config", None)
+        if isinstance(extra, dict) and extra.get("ocr_expert_prepack"):
+            raise ValueError("ocr_expert_prepack requires VLLM_FL_OCR_EXPERT_PREPACK=1")
     ocr_head_major_kv_enabled(config)
     if config.scheduler_config.async_scheduling:
         raise ValueError("Unlimited-OCR requires synchronous scheduling")

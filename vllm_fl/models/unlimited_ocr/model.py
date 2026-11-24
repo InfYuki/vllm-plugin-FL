@@ -315,3 +315,21 @@ class UnlimitedOCRForCausalLM(DeepseekOCRForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         if not isinstance(self.sam_model, StageMissingLayer):
             install_ocr_sam_attention(self.sam_model)
+
+        extra = vllm_config.additional_config
+        if isinstance(extra, dict) and extra.get("ocr_expert_prepack"):
+            from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+            from vllm_fl.dispatch import get_default_manager
+            from vllm_fl.dispatch.binding import OperatorBinding
+            from vllm_fl.ops.fused_moe.layer import UnquantizedFusedMoEMethodFL
+
+            experts = [layer for layer in self.modules() if isinstance(layer, RoutedExperts)]
+            if len(experts) != 11:
+                raise ValueError(f"OCR expert prepack expected 11 routed layers, found {len(experts)}")
+            binding = OperatorBinding(get_default_manager(), "ocr_expert_prepack")
+            binding.preflight()
+            for layer in experts:
+                if not isinstance(layer.quant_method, UnquantizedFusedMoEMethodFL):
+                    raise TypeError("OCR expert prepack requires FL unquantized MoE")
+                layer.quant_method.ocr_expert_prepack = binding
