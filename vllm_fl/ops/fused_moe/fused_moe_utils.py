@@ -148,15 +148,27 @@ def select_unquantized_moe_backend_oot(
 
     if current_platform.device_type == "npu":
         parallel = moe_config.moe_parallel_config
-        if (
-            moe_config.is_lora_enabled
-            or parallel.use_ep
-            or parallel.dp_size != 1
-            or parallel.use_batched_activation_format
-        ):
-            raise NotImplementedError(
-                "Ascend grouped MoE currently requires non-EP, DP1 without LoRA"
-            )
+        if moe_config.is_lora_enabled or parallel.use_batched_activation_format:
+            raise NotImplementedError("Ascend grouped MoE requires ordinary experts without LoRA")
+        if parallel.use_ep or parallel.dp_size != 1:
+            from vllm.config import get_current_vllm_config_or_none
+
+            config = get_current_vllm_config_or_none()
+            model = config.model_config if config is not None else None
+            if (
+                model is None
+                or getattr(model.hf_config, "model_type", None) != "qwen4_exp"
+                or moe_config.in_dtype != torch.bfloat16
+                or current_platform.dist_backend != "hccl"
+                or parallel.enable_eplb
+                or parallel.pcp_size != 1
+                or config.parallel_config.expert_placement_strategy != "linear"
+                or moe_config.num_experts % parallel.ep_size
+                or parallel.all2all_backend != "allgather_reducescatter"
+            ):
+                raise NotImplementedError(
+                    "Ascend DP/EP requires BF16 Qwen3.8, HCCL AgRs and linear expert placement"
+                )
         if moe_config.moe_backend not in ("auto", "triton"):
             raise NotImplementedError("Unsupported explicit Ascend MoE backend")
         return UnquantizedMoeBackend.TRITON, TritonExpertsFL

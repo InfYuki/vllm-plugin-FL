@@ -53,6 +53,7 @@ VENDOR_DEVICE_MAP: dict[str, dict[str, str]] = {
 # Operators can opt a platform in without a code change via the override below.
 _DEVICE_CONTROL_ENV_VAR_PLACEHOLDER = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 _VALIDATED_DEVICE_CONTROL_ENV_VARS = {
+    "ascend": "ASCEND_RT_VISIBLE_DEVICES",
     "nvidia": "CUDA_VISIBLE_DEVICES",
     "kunlunxin": "CUDA_VISIBLE_DEVICES",
     "tsingmicro": "TXDA_VISIBLE_DEVICES",

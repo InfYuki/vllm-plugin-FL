@@ -48,12 +48,29 @@ from vllm_fl.utils import (
 logger = init_logger(__name__)
 
 
+_ASCEND_GRAPH_COMPILER = "vllm_fl.compilation.ascend_compiler.AscendGraphCompiler"
+
+
+def _uses_qwen38_shared_expert_graph(vllm_config: "VllmConfig") -> bool:
+    from vllm.config import CUDAGraphMode
+
+    model = vllm_config.model_config
+    return (
+        model is not None
+        and getattr(model.hf_config, "model_type", None) == "qwen4_exp"
+        and not model.enforce_eager
+        and vllm_config.speculative_config is None
+        and vllm_config.compilation_config.cudagraph_mode
+        == CUDAGraphMode.FULL_DECODE_ONLY
+        and vllm_config.parallel_config.use_sequence_parallel_moe
+        and bool((vllm_config.additional_config or {}).get("enable_shared_expert_dp"))
+    )
+
+
 def _configure_ascend_compilation(vllm_config: "VllmConfig") -> None:
     """Configure eager FX execution with ordinary Ascend FULL decode graphs.
 
-    Ascend compiler options may be omitted or explicitly disabled with False.
-    The six recognized rc1 compiler options have no implementation here; reject
-    true values, non-booleans and unknown keys, including in eager mode.
+    The Qwen3.8 path can optionally compile static kernels with npugraph_ex.
     """
     from vllm.config import CompilationMode, CUDAGraphMode
 
@@ -65,27 +82,36 @@ def _configure_ascend_compilation(vllm_config: "VllmConfig") -> None:
     ascend_compilation = additional_config.get("ascend_compilation_config", {})
     if not isinstance(ascend_compilation, dict):
         raise TypeError("additional_config.ascend_compilation_config must be a dict")
+    qwen_compiler_options = {"enable_npugraph_ex", "enable_static_kernel"}
     disabled_compiler_options = {
-        "enable_npugraph_ex",
-        "enable_static_kernel",
+        "enable_super_kernel",
         "fuse_norm_quant",
         "fuse_qknorm_rope",
         "fuse_allreduce_rms",
         "fuse_muls_add",
     }
     for name, enabled in ascend_compilation.items():
-        if name not in disabled_compiler_options:
+        if name not in disabled_compiler_options | qwen_compiler_options:
             raise ValueError(f"Unknown ascend_compilation_config option: {name!r}")
         if not isinstance(enabled, bool):
             raise TypeError(f"ascend_compilation_config.{name} must be bool")
-        if enabled:
+        if enabled and name in disabled_compiler_options:
             raise NotImplementedError(
-                f"{name}=true is not supported by FL basic Ascend graph support"
+                f"{name}=true is not supported by FL Ascend graph support"
             )
 
     compilation = vllm_config.compilation_config
     model_config = vllm_config.model_config
     enforce_eager = bool(model_config is not None and model_config.enforce_eager)
+    use_npugraph_ex = ascend_compilation.get("enable_npugraph_ex", False)
+    use_static = ascend_compilation.get("enable_static_kernel", False)
+    if use_npugraph_ex or use_static:
+        if model_config is None or getattr(model_config.hf_config, "model_type", None) != "qwen4_exp":
+            raise ValueError("FL npugraph_ex requires Qwen3.8-Flash-Next")
+        if enforce_eager or compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
+            raise ValueError("FL npugraph_ex requires FULL_DECODE_ONLY")
+        if use_static and not use_npugraph_ex:
+            raise ValueError("FL static kernels require npugraph_ex")
     if (
         model_config is None
         or enforce_eager
@@ -130,7 +156,7 @@ def _configure_ascend_compilation(vllm_config: "VllmConfig") -> None:
             "the Inductor backend is not supported on torch_npu."
         )
     compilation.mode = CompilationMode.VLLM_COMPILE
-    compilation.backend = "eager"
+    compilation.backend = _ASCEND_GRAPH_COMPILER if use_npugraph_ex else "eager"
     compilation.use_inductor = False
     compilation.use_inductor_graph_partition = False
     compilation.splitting_ops = []
@@ -138,6 +164,19 @@ def _configure_ascend_compilation(vllm_config: "VllmConfig") -> None:
     compilation.pass_config.fuse_norm_quant = False
     compilation.pass_config.fuse_act_quant = False
     compilation.pass_config.fuse_attn_quant = False
+    if _uses_qwen38_shared_expert_graph(vllm_config):
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        sizes = compilation.cudagraph_capture_sizes or []
+        aligned = [size for size in sizes if size % tp_size == 0]
+        if not aligned:
+            raise ValueError(
+                f"Qwen3.8 shared-expert DP needs a FULL graph size divisible by "
+                f"TP={tp_size}; got {sizes}"
+            )
+        compilation.cudagraph_capture_sizes = aligned
+        compilation.max_cudagraph_capture_size = aligned[-1]
+        compilation.post_init_cudagraph_sizes()
+        logger.info("FL Qwen3.8 TP-aligned FULL decode graph sizes: %s", aligned)
 
 
 _P = ParamSpec("_P")
@@ -318,7 +357,7 @@ class PlatformFL(Platform):
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
-        """Install MetaX graph defaults before vLLM finalizes graph settings.
+        """Install platform graph defaults before vLLM finalizes graph settings.
 
         vLLM calls this right after CLI parsing, before the cudagraph capture
         sizes / max graph size are derived from the graph mode. Setting the
@@ -330,6 +369,17 @@ class PlatformFL(Platform):
         untouched. Rewriting a finalized ``NONE`` to ``PIECEWISE`` afterwards
         would also trip vLLM's "piecewise requires VLLM_COMPILE" assertion.
         """
+        if cls.device_type == "npu" and _uses_qwen38_shared_expert_graph(vllm_config):
+            compilation = vllm_config.compilation_config
+            if (
+                compilation.cudagraph_capture_sizes is None
+                and compilation.max_cudagraph_capture_size is None
+            ):
+                # Ascend caps the default at one decode step per sequence.
+                compilation.max_cudagraph_capture_size = min(
+                    vllm_config.scheduler_config.max_num_seqs, 512
+                )
+
         if cls.vendor_name != "metax":
             return
 
@@ -781,7 +831,19 @@ class PlatformFL(Platform):
         return "vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU"
 
     @classmethod
+    def _use_qwen38_hccl(cls) -> bool:
+        if cls.device_type != "npu" or cls.dist_backend != "hccl":
+            return False
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        model = config.model_config if config is not None else None
+        return model is not None and getattr(model.hf_config, "model_type", None) == "qwen4_exp"
+
+    @classmethod
     def get_device_communicator_cls(cls) -> str:
+        if cls._use_qwen38_hccl():
+            return "vllm_fl.distributed.device_communicators.npu_communicator.NPUCommunicator"
         if cls.dist_backend == "flagcx":
             logger.info("Using CommunicatorFL for communication.")
             return "vllm_fl.distributed.communicator.CommunicatorFL"  # noqa
@@ -797,10 +859,11 @@ class PlatformFL(Platform):
 
     @classmethod
     def get_compile_backend(cls) -> str:
-        if cls.device_type in ("npu", "musa"):
-            # Trace and split through Dynamo, then capture the FX modules with
-            # the platform graph wrapper. MUSA Inductor code generation can take
-            # hours for a single range before native graph capture starts.
+        if cls.device_type == "npu":
+            # vLLM 0.32 resolves a custom compiler through the platform hook.
+            # _configure_ascend_compilation selects eager unless explicitly enabled.
+            return _ASCEND_GRAPH_COMPILER
+        if cls.device_type == "musa":
             return "eager"
         return super().get_compile_backend()
 
@@ -933,7 +996,8 @@ class PlatformFL(Platform):
     def use_custom_op_collectives(cls) -> bool:
         # Retain the registered collective routes for TXDA and native MCCL.
         return (
-            cls.device_type == "txda"
+            cls._use_qwen38_hccl()
+            or cls.device_type == "txda"
             or cls.vendor_name in ("nvidia", "thead", "iluvatar")
             or (cls.device_type == "musa" and cls.dist_backend == "mccl")
         )

@@ -9,7 +9,7 @@ import gc
 import os
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from datetime import timedelta
 from fnmatch import filter as fnmatch_filter
 from types import NoneType
@@ -501,14 +501,52 @@ class WorkerFL(WorkerBase):
             torch._C._accelerator_setAllocatorSettings(original_settings)
 
     @instrument(span_name="Init device")
+    def _bind_ascend_worker_cpus(self, visible_device_index: int) -> None:
+        # The single-host service exposes all TP × DP devices to each worker.
+        parallel = self.parallel_config
+        devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").split(",")
+        count = parallel.tensor_parallel_size * parallel.data_parallel_size
+        if (
+            parallel.pipeline_parallel_size != 1
+            or len(devices) != count
+            or len(set(devices)) != count
+            or not all(device.isdecimal() for device in devices)
+            or not 0 <= visible_device_index < count
+        ):
+            raise ValueError("CPU binding requires the complete single-host Ascend device list")
+        allowed = sorted(os.sched_getaffinity(0))
+        start = len(allowed) * visible_device_index // count
+        stop = len(allowed) * (visible_device_index + 1) // count
+        cpus = set(allowed[start:stop])
+        if len(cpus) < int(os.environ.get("OMP_NUM_THREADS", "1")):
+            raise ValueError("CPU binding pool is smaller than OMP_NUM_THREADS")
+        os.sched_setaffinity(0, cpus)
+        for tid in os.listdir("/proc/self/task"):
+            with suppress(ProcessLookupError):
+                os.sched_setaffinity(int(tid), cpus)
+        logger.info(
+            "Ascend worker CPU binding device=%s cpus=%s",
+            devices[visible_device_index], sorted(os.sched_getaffinity(0)),
+        )
+
     def init_device(self):
         _apply_worker_vendor_patches()
         if self.device_config.device_type == current_platform.device_type:
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
+            assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
+            # vLLM assigns a device slice to each local Ascend DP engine.
+            # Worker ranks index that slice from zero.
+            has_dp_device_slice = (
+                current_platform.device_type == "npu"
+                and parallel_config.data_parallel_size > 1
+                and assigned_physical_gpu_ids is not None
+                and len(assigned_physical_gpu_ids) == parallel_config.local_world_size
+            )
             if (
-                parallel_config.distributed_executor_backend
+                not has_dp_device_slice
+                and parallel_config.distributed_executor_backend
                 not in ("ray", "external_launcher")
                 and parallel_config.data_parallel_backend != "ray"
                 and parallel_config.nnodes_within_dp == 1
@@ -529,7 +567,6 @@ class WorkerFL(WorkerBase):
 
             # Publish the logical-to-physical mapping for topology queries
             # such as NIC affinity and P2P checks.
-            assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
             if assigned_physical_gpu_ids is not None:
                 from vllm.platforms.interface import set_assigned_physical_gpu_ids
 
@@ -569,6 +606,11 @@ class WorkerFL(WorkerBase):
             self.device = torch.device(
                 f"{current_platform.device_type}:{visible_device_index}"
             )
+            if (
+                current_platform.device_type == "npu"
+                and (self.vllm_config.additional_config or {}).get("enable_cpu_binding")
+            ):
+                self._bind_ascend_worker_cpus(visible_device_index)
             current_platform.set_device(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
@@ -576,12 +618,12 @@ class WorkerFL(WorkerBase):
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
-            # available memory
+            # available memory. The NPU GroupCoordinator uses a visible ordinal.
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
                 self.distributed_init_method,
-                self.local_rank,
+                visible_device_index if self.device.type == "npu" else self.local_rank,
                 current_platform.dist_backend,
             )
 
@@ -1568,7 +1610,9 @@ class WorkerFL(WorkerBase):
                 self.profiler = create_worker_profiler(
                     self.profiler_config,
                     worker_name=trace_name,
-                    local_rank=self.local_rank,
+                    local_rank=(
+                        self.device.index if self.device.type == "npu" else self.local_rank
+                    ),
                 )
 
             self.profiler.set_output_name(trace_name)

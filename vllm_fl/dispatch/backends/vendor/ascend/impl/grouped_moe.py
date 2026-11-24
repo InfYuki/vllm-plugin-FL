@@ -44,16 +44,14 @@ def grouped_experts(
     if tokens == 0:
         return hidden_states.new_empty((0, w2.shape[1]))
     if (
-        expert_map is None
-        and not apply_router_weight_on_input
+        not apply_router_weight_on_input
         and w1_bias is None
         and w2_bias is None
         and clamp_limit is None
         and activation != "gelu_tanh_no_mul"
     ):
-        # Fixed-size routing keeps all indices and expert counts on device.
-        # The general path below uses nonzero-shaped tensors and cannot be
-        # captured when the number of active experts changes between steps.
+        # Fixed-size native routing handles both replicated and sharded
+        # experts, keeping the routing shape stable across graph replays.
         from .fused_moe import _torch_fused_experts_impl
 
         return _torch_fused_experts_impl(
@@ -63,6 +61,7 @@ def grouped_experts(
             topk_weights,
             topk_ids,
             activation=activation,
+            expert_map=expert_map,
         )
     local_ids = topk_ids.long()
     if expert_map is not None:

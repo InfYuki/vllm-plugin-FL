@@ -363,7 +363,12 @@ def register_model():
         # configuration resolution in worker processes.
         from vllm.model_executor.models import ModelRegistry
 
+        from vllm_fl.patches.qwen3_8_flash_next import (
+            apply_qwen3_8_flash_next_patches,
+        )
         from vllm_fl.quantization import modelslim_w8a8  # noqa: F401
+
+        apply_qwen3_8_flash_next_patches()
 
         # Reuse vLLM's DeepSeek-V4 model and loader with an Ascend-only
         # attention/cache adapter for the torch_npu empty build.

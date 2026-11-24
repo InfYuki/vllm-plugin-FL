@@ -17,6 +17,8 @@ from dataclasses import replace
 from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
+from os import getenv
+
 import numpy as np
 import torch
 import torch.distributed
@@ -56,6 +58,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -546,6 +549,31 @@ class ModelRunnerFL(
         self.use_ascend_attention = (
             getattr(current_platform, "vendor_name", None) == "ascend"
         )
+        self._qsa_graph_max_seq_len = (vllm_config.additional_config or {}).get(
+            "qsa_graph_max_seq_len", 0
+        )
+        qsa_graph_bound = self._qsa_graph_max_seq_len
+        if type(qsa_graph_bound) is not int or not 0 <= qsa_graph_bound <= 2048:
+            raise ValueError("qsa_graph_max_seq_len must be an integer in [0, 2048]")
+        if qsa_graph_bound and (
+            not self.use_ascend_attention
+            or self.speculative_config is not None
+            or vllm_config.kv_transfer_config is not None
+        ):
+            raise ValueError(
+                "QSA graph specialization requires Ascend, no MTP and no KV transfer"
+            )
+        self._qwen38_static_decode_only = (
+            self.use_ascend_attention
+            and getattr(self.model_config.hf_config, "model_type", None) == "qwen4_exp"
+            and self.speculative_config is None
+            and self.compilation_config.cudagraph_mode
+            == CUDAGraphMode.FULL_DECODE_ONLY
+            and (vllm_config.additional_config or {})
+            .get("ascend_compilation_config", {})
+            .get("enable_static_kernel", False)
+        )
+        self._graph_capture_complete = False
         self._ascend_attn_state = None
         self.graph_runtime = None
         if self.use_ascend_attention:
@@ -578,6 +606,17 @@ class ModelRunnerFL(
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        self._qwen38_native_decode = getenv("VLLM_FL_QWEN38_NATIVE_DECODE") == "1"
+        self._qwen38_mc2_active_mask = None
+        if self.use_ascend_attention and (vllm_config.additional_config or {}).get(
+            "enable_qwen38_mc2"
+        ):
+            # All graph buckets and MoE layers on this rank reuse this storage.
+            self._qwen38_mc2_active_mask = torch.zeros(
+                cdiv(self.max_num_tokens, parallel_config.tensor_parallel_size),
+                dtype=torch.bool,
+                device=self.device,
+            )
         self.max_num_reqs = scheduler_config.max_num_seqs
 
         # Broadcast PP output for external_launcher (torchrun)
@@ -616,7 +655,12 @@ class ModelRunnerFL(
         self._pp_recv_work: torch.distributed.Work | None = None
 
         # Sampler
-        self.sampler = Sampler(
+        sampler_cls = Sampler
+        if self.device.type == "npu" and self.model_config.hf_config.model_type == "qwen4_exp":
+            from vllm_fl.dispatch.backends.vendor.ascend.impl.sampler import AscendSampler
+
+            sampler_cls = AscendSampler
+        self.sampler = sampler_cls(
             logprobs_mode=self.model_config.logprobs_mode,
             use_fp64_gumbel=self.model_config.use_fp64_gumbel,
         )
@@ -840,6 +884,7 @@ class ModelRunnerFL(
         # [max_num_reqs, depth] prompt token ids preceding each request's chunk
         # start, for models exposing `token_lookback_depth`. Sized after load.
         self.lookback_token_ids: CpuGpuBuffer | None = None
+        self._legacy_model_state = None
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
@@ -1297,7 +1342,8 @@ class ModelRunnerFL(
         req_state: CachedRequestState | None,
     ) -> None:
         """Hook for platform runners to clean request-scoped side caches."""
-        del req_id, req_state
+        if self._legacy_model_state is not None:
+            self._legacy_model_state.remove_requests((req_id,))
 
     def _process_encoder_cache_scheduler_output(
         self,
@@ -1626,6 +1672,8 @@ class ModelRunnerFL(
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
+            if self._legacy_model_state is not None:
+                self._legacy_model_state.remove_requests((request.req_id,))
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
@@ -3467,6 +3515,39 @@ class ModelRunnerFL(
         padding_mask[num_tokens_unpadded:].fill_(True)
         return padding_mask
 
+    def _prepare_qwen38_mc2_active_mask(
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+    ) -> None:
+        mask = self._qwen38_mc2_active_mask
+        if mask is None:
+            return
+        context = get_forward_context()
+        if cudagraph_mode != CUDAGraphMode.FULL:
+            dp = context.dp_metadata
+            if (
+                not self._qwen38_native_decode
+                or cudagraph_mode != CUDAGraphMode.NONE
+                or not context.skip_compiled
+                or dp is None
+                or not 0 < int(dp.num_tokens_across_dp_cpu.max()) <= 8
+            ):
+                return
+
+        tp_group = get_tp_group()
+        # Qwen3Next's sequence_parallel_chunk pads the local token axis to a
+        # multiple of TP, then gives each TP rank a contiguous token slice.
+        rows = cdiv(num_tokens_padded, tp_group.world_size)
+        start = tp_group.rank_in_group * rows
+        active_rows = min(rows, max(0, num_tokens_unpadded - start))
+        # Write before capture or replay, including any extra MC2 rows added
+        # to reach the common DP row count.
+        mask[:active_rows].fill_(True)
+        mask[active_rows:].fill_(False)
+        context.additional_kwargs["qwen38_mc2_active_mask"] = mask
+
     def _pad_query_start_loc_for_fia(
         self,
         query_start_loc: CpuGpuBuffer,
@@ -3846,6 +3927,16 @@ class ModelRunnerFL(
         finally:
             self.prepare_inputs_event.record()
 
+    def _skip_qwen38_eager_compilation(self, mode: CUDAGraphMode) -> bool:
+        # Static compilation uses a local-world rendezvous. Request-driven
+        # eager shapes can differ between DP ranks, including dummy forwards.
+        # Keep the coordinated startup warmup/capture on the compiled path.
+        return (
+            self._qwen38_static_decode_only
+            and self._graph_capture_complete
+            and mode == CUDAGraphMode.NONE
+        )
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -3944,6 +4035,21 @@ class ModelRunnerFL(
                     return False
         return True
 
+    def _qsa_graph_requires_eager(self, num_reqs: int) -> bool:
+        # Called after _prepare_inputs has added this step's scheduled tokens
+        # to the CPU prefix lengths. A FULL graph always uses select-all
+        # QSA when specialization is enabled.
+        bound = self._qsa_graph_max_seq_len
+        if not bound:
+            return False
+        lengths = self.optimistic_seq_lens_cpu[:num_reqs].numpy()
+        return (
+            lengths.size != num_reqs
+            or not lengths.size
+            or int(lengths.min()) <= 0
+            or int(lengths.max()) > bound
+        )
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -4031,6 +4137,15 @@ class ModelRunnerFL(
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+            elif (
+                self._qsa_graph_max_seq_len
+                and synced_cudagraph_mode == CUDAGraphMode.NONE.value
+            ):
+                # Honor a peer's eager fallback even if coordination does
+                # not return a padded token vector.
+                cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                    num_tokens, valid_modes={CUDAGraphMode.NONE}
+                )
 
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
@@ -4277,6 +4392,9 @@ class ModelRunnerFL(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=False,
                 disable_full=disable_full,
+                # A long local request advertises NONE to DP coordination;
+                # this keeps EP peers on the same eager execution mode.
+                force_eager=self._qsa_graph_requires_eager(num_reqs),
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 allow_microbatching=self._allow_microbatching(
                     num_reqs, num_scheduled_tokens_np
@@ -4414,6 +4532,12 @@ class ModelRunnerFL(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+            if self._legacy_model_state is not None:
+                model_kwargs.update(
+                    self._legacy_model_state.prepare_inputs(
+                        num_reqs, num_reqs_padded, input_ids
+                    )
+                )
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
@@ -4445,7 +4569,10 @@ class ModelRunnerFL(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
+                skip_compiled=(
+                    has_encoder_input
+                    or self._skip_qwen38_eager_compilation(cudagraph_mode)
+                ),
                 is_padding=is_padding,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
@@ -4454,6 +4581,9 @@ class ModelRunnerFL(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            self._prepare_qwen38_mc2_active_mask(
+                cudagraph_mode, num_tokens_unpadded, num_tokens_padded
+            )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -5314,6 +5444,12 @@ class ModelRunnerFL(
                         vllm_config=self.vllm_config,
                         model_config=self.model_config,
                     )
+                state_factory = getattr(
+                    self.model, "get_legacy_model_state_cls", None
+                )
+                self._legacy_model_state = (
+                    state_factory()(self) if state_factory is not None else None
+                )
                 lookback_depth = getattr(self.model, "token_lookback_depth", 0)
                 if lookback_depth > 0:
                     self.lookback_token_ids = self._make_buffer(
@@ -6092,6 +6228,12 @@ class ModelRunnerFL(
                 for slot_mapping in slot_mappings_by_group.values():
                     slot_mapping.fill_(-1)
 
+            legacy_model_kwargs = {}
+            if self._legacy_model_state is not None:
+                legacy_model_kwargs = self._legacy_model_state.prepare_dummy_inputs(
+                    num_reqs, num_reqs_padded, num_scheduled_tokens
+                )
+
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens,
@@ -6117,6 +6259,7 @@ class ModelRunnerFL(
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
 
+            model_kwargs.update(legacy_model_kwargs)
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
             else:
@@ -6164,9 +6307,22 @@ class ModelRunnerFL(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    skip_compiled=self._skip_qwen38_eager_compilation(
+                        cudagraph_runtime_mode
+                    ),
                     is_padding=is_padding,
                 ),
             ):
+                # The synthetic decode input participates in MC2, as in the
+                # Ascend V1 dummy path. TP alignment rows still stay masked.
+                mc2_live_tokens = (
+                    num_tokens_padded
+                    if not self._qwen38_native_decode or is_graph_capturing or is_profile
+                    else num_tokens_unpadded
+                )
+                self._prepare_qwen38_mc2_active_mask(
+                    cudagraph_runtime_mode, mc2_live_tokens, num_tokens_padded
+                )
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -6915,6 +7071,27 @@ class ModelRunnerFL(
             )
             return 0
 
+        if getenv("VLLM_FL_QWEN38_FULL_FIA") == "1":
+            if not (
+                self.use_ascend_attention
+                and self._qwen38_native_decode
+                and self.speculative_config is None
+                and self._qsa_graph_max_seq_len == 2048
+                and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+                and self.compilation_config.cudagraph_capture_sizes == [8]
+                and self.parallel_config.tensor_parallel_size == 8
+                and self.parallel_config.data_parallel_size == 2
+                and self.parallel_config.pipeline_parallel_size == 1
+                and not self.parallel_config.use_ubatching
+                and self.vllm_config.quant_config is None
+            ):
+                raise ValueError("Qwen3.8 FULL FIA requires BF16 TP8 DP2 and FULL [8] without MTP")
+            from vllm_fl.models.qwen3_8_flash_next.gpu.ops.qsa_fia_full import (
+                prepare_full_fia_workspace,
+            )
+
+            prepare_full_fia_workspace(self.device)
+
         # Initialize encoder CUDA graph manager if enabled.
         self._maybe_init_encoder_cudagraph_manager()
 
@@ -7020,6 +7197,7 @@ class ModelRunnerFL(
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+        self._graph_capture_complete = True
         return cuda_graph_size
 
     def _warmup_and_capture(

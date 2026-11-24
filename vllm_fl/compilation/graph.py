@@ -7,7 +7,7 @@
 import dataclasses
 import weakref
 from collections.abc import Callable
-from contextlib import ExitStack, nullcontext, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from typing import Any, ClassVar
 from unittest.mock import patch
 
@@ -28,6 +28,27 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import current_stream
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _static_moe_layer_resolution():
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    original = moe_runner.get_layer_from_name
+
+    def resolve(layer_name):
+        layer = original(layer_name)
+        if layer_name == "from_forward_context":
+            context = get_forward_context()
+            layers = context.all_moe_layers
+            if layers and context.moe_layer_index == len(layers):
+                # Static kernel recording and execution traverse the same
+                # unsplit FX graph under one ForwardContext.
+                context.moe_layer_index = 0
+        return layer
+
+    with patch.object(moe_runner, "get_layer_from_name", resolve):
+        yield
 
 
 # FL-specific: platform-agnostic weak_ref_tensors
@@ -236,6 +257,15 @@ class GraphWrapper:
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
         self.graph_runtime = graph_runtime
+        self._reuse_static_moe_layers = (
+            current_platform.device_type == "npu"
+            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            and self.compilation_config.fast_moe_cold_start
+            and not self.compilation_config.splitting_ops
+            and (vllm_config.additional_config or {})
+            .get("ascend_compilation_config", {})
+            .get("enable_static_kernel", False)
+        )
 
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
@@ -292,6 +322,12 @@ class GraphWrapper:
     def _weak_ref_output(self, output):
         return weak_ref_tensors(output)
 
+    def _run_with_forward_context(self, *args, **kwargs):
+        if self._reuse_static_moe_layers and get_forward_context().all_moe_layers:
+            with _static_moe_layer_resolution():
+                return self.runnable(*args, **kwargs)
+        return self.runnable(*args, **kwargs)
+
     def __call__(self, *args, **kwargs):
         if not is_forward_context_available():
             # No forward context means we are outside the normal
@@ -306,7 +342,7 @@ class GraphWrapper:
             graph_runtime_mode == CUDAGraphMode.NONE
             or graph_runtime_mode != self.runtime_mode
         ):
-            return self.runnable(*args, **kwargs)
+            return self._run_with_forward_context(*args, **kwargs)
 
         assert batch_descriptor is not None
         if batch_descriptor not in self.concrete_graph_entries:
@@ -379,7 +415,7 @@ class GraphWrapper:
                     stream=_graph_capture_stream(),
                 ),
             ):
-                output = self.runnable(*args, **kwargs)
+                output = self._run_with_forward_context(*args, **kwargs)
                 with suppress(ImportError, RuntimeError, UnboundLocalError):
                     get_offloader().join_after_forward()
                 if self.cudagraph_options.weak_ref_output:
@@ -411,15 +447,23 @@ class GraphWrapper:
     def _replay_graph(self, entry, args, kwargs):
         self._validate_replay_addresses(entry, args)
         # Sync offloader before replay if available.
+        ordinary_offloader_is_noop = False
         with suppress(ImportError, RuntimeError):
-            from vllm.model_executor.offloader.base import get_offloader
+            from vllm.model_executor.offloader.base import NoopOffloader, get_offloader
 
-            get_offloader().sync_prev_onload()
-        if current_platform.device_type == "npu":
-            current_platform.torch_device_fn.synchronize()
+            offloader = get_offloader()
+            offloader.sync_prev_onload()
+            ordinary_offloader_is_noop = type(offloader) is NoopOffloader
+        is_npu = current_platform.device_type == "npu"
         if self.graph_runtime is not None:
-            with self.graph_runtime.replay_scope(get_forward_context()):
+            with self.graph_runtime.replay_scope(
+                get_forward_context(),
+                synchronize_device=is_npu,
+                allow_native_decode=ordinary_offloader_is_noop,
+            ):
                 entry.graph.replay()
         else:
+            if is_npu:
+                current_platform.torch_device_fn.synchronize()
             entry.graph.replay()
         return entry.output

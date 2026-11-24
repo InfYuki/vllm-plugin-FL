@@ -53,7 +53,7 @@ def test_gdn_prefill_matches_token_decode():
         index,
         torch.tensor([False], device="npu"),
         conv,
-        state[1],
+        state,
         output,
         **kwargs,
     )

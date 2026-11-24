@@ -35,7 +35,7 @@ def _torch_fused_experts_impl(
     global_num_experts: int = -1,
     expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Unquantized, non-EP routing and GMM using packaged torch_npu ops.
+    """Unquantized local-expert routing and GMM using packaged torch_npu ops.
 
     Mirrors current vLLM-Ascend AllGather dispatch/MLP/combine semantics.
     Routing produces fixed-size expanded tensors; no host reads or dynamic
@@ -43,8 +43,9 @@ def _torch_fused_experts_impl(
     """
     num_tokens = hidden_states.size(0)
     num_experts = w1.size(0)
-    if expert_map is not None or global_num_experts not in (-1, num_experts):
-        raise NotImplementedError("Ascend grouped MoE requires all experts locally")
+    total_experts = num_experts if expert_map is None else expert_map.numel()
+    if global_num_experts not in (-1, total_experts):
+        raise ValueError("Ascend MoE expert count does not match its expert map")
     if apply_router_weight_on_input:
         raise NotImplementedError("Ascend grouped MoE requires output router weights")
     if activation not in ("silu", "gelu", "gelu_tanh", "silu_no_mul", "gelu_no_mul"):
@@ -55,16 +56,24 @@ def _torch_fused_experts_impl(
     # The current rc1 dispatcher uses count-mode expert tokens and pairs its
     # init-routing interface with token_unpermute (not finalize_routing).
     # BF16 needs no custom quantization/routing extension.
-    # vLLM 0.32 marks padded routes with -1. Native fixed-size routing expects
-    # valid expert IDs, so give inactive routes a harmless expert and zero weight.
-    valid_routes = (topk_ids >= 0) & (topk_ids < num_experts)
-    route_ids = torch.where(valid_routes, topk_ids, 0).to(torch.int32)
-    route_weights = torch.where(valid_routes, topk_weights, 0)
+    valid_routes = (topk_ids >= 0) & (topk_ids < total_experts)
+    routing_experts = num_experts
+    if expert_map is None:
+        # Native routing expects in-range IDs even for padded entries.
+        route_ids = torch.where(valid_routes, topk_ids, 0).to(torch.int32)
+    else:
+        safe_global_ids = topk_ids.clamp(0, total_experts - 1).flatten().long()
+        local_ids = expert_map.index_select(0, safe_global_ids).view_as(topk_ids)
+        valid_routes = valid_routes & (local_ids >= 0) & (local_ids < num_experts)
+        # Pack local expert IDs into the active range. Assign other routes to
+        # an inactive expert so they consume no rows in either grouped matmul.
+        route_ids = torch.where(valid_routes, local_ids, num_experts).to(torch.int32)
+        routing_experts += 1
     routed, row_indices, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
         hidden_states,
         route_ids,
         active_num=num_tokens * topk_ids.size(1),
-        expert_num=num_experts,
+        expert_num=routing_experts,
         expert_tokens_num_type=1,
         expert_tokens_num_flag=True,
         active_expert_range=[0, num_experts],
@@ -101,11 +110,22 @@ def _torch_fused_experts_impl(
         group_type=0,
         group_list=group_list,
     )[0]
-    result = torch_npu.npu_moe_token_unpermute(
-        permuted_tokens=expert_output,
-        sorted_indices=torch.abs(row_indices),
-        probs=route_weights,
-    )
+    if expert_map is None:
+        result = torch_npu.npu_moe_token_unpermute(
+            permuted_tokens=expert_output,
+            sorted_indices=torch.abs(row_indices),
+            probs=torch.where(valid_routes, topk_weights, 0),
+        )
+    else:
+        # Init-routing returns a gather index per original route. Read a safe
+        # row for inactive entries and mask them even if that row is undefined
+        # (for example when this rank owns none of the selected experts).
+        valid = valid_routes.flatten()
+        safe_rows = torch.where(valid, row_indices, 0).long()
+        outputs = expert_output.index_select(0, safe_rows)
+        weighted = outputs.float() * topk_weights.flatten()[:, None]
+        weighted = torch.where(valid[:, None], weighted, 0).to(hidden_states.dtype)
+        result = weighted.view(num_tokens, topk_ids.size(1), w2.size(1)).sum(dim=1)
     if inplace:
         hidden_states.copy_(result)
         return hidden_states
