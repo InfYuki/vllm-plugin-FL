@@ -392,32 +392,19 @@ If you want to use the original CUDA operators, you can set the following enviro
 export USE_FLAGGEMS=0
 ```
 
-## Unlimited-OCR TP1 SAM relative position bias comparison
+## Unlimited-OCR TP1 with full-image SAM bias
 
-The candidate uses port 19724 and constructs the SAM relative position bias in
-whole-image batch tiles targeting 128 MiB per bias tensor. Each tile keeps all
-query and key positions for its images and uses the existing FIA operator. The
-baseline uses port 19725 and constructs the bias for the entire image batch.
-Both modes enable the R-SWA valid-query-row path, expanded softmax + Top-6,
-causal prefill, and BF16 expert prepacking. Use the same device for both modes.
-The shared configuration is TP1, 256-token KV pages, 64 sequences, a 2048-token
-scheduler budget, a 4096 MiB mask limit, and 0.95 device-memory utilization.
-
-Start the candidate server on an available device.
+Both launch modes use the OCR implementation from `e93c12a`, including R-SWA
+valid query rows, extended Top-6, and BF16 expert prepacking. SAM computes
+the relative position bias for the full image batch. The default endpoint
+uses port 19726. The `baseline` alias uses the same settings on port 19727.
 
 ```bash
-DEVICES=1 bash run_server.sh candidate
+DEVICES=1 bash run_server.sh
 ```
 
-After the server is ready, run the three input lengths from another terminal
-in the same worktree.
+Run the benchmark in a second shell in the same worktree.
 
 ```bash
-for n in 1024 4096 16384; do bash run_perf.sh "$n" candidate || break; done
+for n in 1024 4096 16384; do bash run_perf.sh "$n" || break; done
 ```
-
-For the comparison, stop the candidate server and replace `candidate` with
-`baseline` in both commands. Each run writes to
-`/workspace/results/tp1-sam-relpos-<mode>-input-<length>-<timestamp>-<pid>`.
-The benchmark uses seed 42, concurrency 64, and 1024 output tokens. Compare
-TTFT, total throughput, and greedy OCR output on fixed images.
