@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--port", type=int, default=10000)
     parser.add_argument("--max-num-seqs", type=int, default=64)
     parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
+    parser.add_argument("--block-size", type=int, choices=(128, 256), default=128)
     parser.add_argument("--rswa-mask-mib", type=int, default=2048)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.80)
     parser.add_argument("--eager", action="store_true")
@@ -89,6 +90,7 @@ def main():
         "--max-model-len=32768",
         f"--max-num-seqs={seqs}",
         f"--max-num-batched-tokens={budget}",
+        f"--block-size={args.block_size}",
         "--enable-chunked-prefill",
         "--no-async-scheduling",
         f"--gpu-memory-utilization={args.gpu_memory_utilization}",

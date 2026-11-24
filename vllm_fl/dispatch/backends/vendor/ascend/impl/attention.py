@@ -359,6 +359,7 @@ class AscendMetadata:
     causal: bool = True
     model_runner_type: str = ""
     ocr_head_major_kv: bool = False
+    kv_block_size: int = 128
 
 
 
@@ -394,9 +395,12 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         self._mask_builder = AttentionMaskBuilder(
             device, ocr_mode=is_unlimited_ocr(self.model_config)
         )
+        self.kv_block_size = (
+            vllm_config.cache_config.block_size if is_unlimited_ocr(self.model_config) else 128
+        )
         self.max_num_blocks_per_req = cdiv(
             self.model_config.max_model_len,
-            AscendAttentionBackend.get_supported_kernel_block_sizes()[0]
+            self.kv_block_size
         )
 
         self.speculative_config = vllm_config.speculative_config
@@ -612,6 +616,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             rswa_window=rswa_window,
             rswa_groups=rswa_groups,
             ocr_head_major_kv=self.ocr_head_major_kv,
+            kv_block_size=self.kv_block_size,
         )
 
     def _split_decodes_and_prefills(self, common_attn_metadata):
@@ -756,6 +761,9 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
+        config = get_current_vllm_config_or_none()
+        if config is not None and is_unlimited_ocr(config.model_config):
+            return [128, 256]
         return [128]
 
 
@@ -859,7 +867,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
 
         table_width = live.block_tables.shape[-1]
-        (block_size,) = AscendAttentionBackend.get_supported_kernel_block_sizes()
+        block_size = getattr(live, "kv_block_size", 128)
         if (
             live.block_tables.shape != (num_tokens, table_width)
             or not cdiv(kv_width, block_size)
@@ -901,6 +909,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 or any(
                     not isinstance(param, FusedInferAttentionGraphParam)
                     or param.layer_name not in metadata
+                    or param.block_size != block_size
                     for param in captured
                 )
             ):
@@ -1059,6 +1068,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         """Get parameters for fused_infer_attention."""
 
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+            # Raw prompt K/V uses no page table. FIA ignores the page size here.
             return key, value, 128, None, attn_metadata.actual_seq_lengths_q
 
         block_table = attn_metadata.block_tables
@@ -1087,7 +1097,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         key_cache = kv_cache[0].transpose(1, 2)
         value_cache = kv_cache[1].transpose(1, 2)
         if (
-            key_cache.shape[1:] != (self.num_kv_heads, 128, self.head_size)
+            key_cache.shape[1:] != (self.num_kv_heads, attn_metadata.kv_block_size, self.head_size)
             or value_cache.shape != key_cache.shape
             or key_cache.dtype != torch.bfloat16
             or value_cache.dtype != key_cache.dtype
@@ -1096,7 +1106,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             or not value_cache.is_contiguous()
         ):
             raise ValueError(
-                "Expected contiguous BF16 [page, head, 128, dim] OCR KV storage"
+                "Expected contiguous BF16 [page, head, configured block size, dim] OCR KV storage"
             )
 
         raw_prefill = attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
@@ -1671,7 +1681,7 @@ def reserve_rswa_graph_buffers(
 
     max_tokens = max(capture_sizes)
     max_kv = config.model_config.max_model_len
-    (block_size,) = AscendAttentionBackend.get_supported_kernel_block_sizes()
+    block_size = config.cache_config.block_size
     max_blocks = cdiv(max_kv, block_size)
     dtype = config.model_config.dtype
     mask = torch.empty((max_tokens, 1, 1, max_kv), dtype=torch.int8, device=device)

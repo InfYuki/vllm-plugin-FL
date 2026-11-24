@@ -142,7 +142,6 @@ def test_attention_graph_updates_mixed_backends(order):
 
 _CAPTURE_SIZES = [1, 2, 4, 8, 16, 32, 64]
 _MAX_LENGTH = 32768
-_BLOCK_SIZE = 128
 _TOTAL_HEADS = 10
 _HEAD_DIM = 128
 _DTYPE = torch.bfloat16
@@ -189,8 +188,8 @@ def tp_group():
             destroy_distributed_environment()
 
 
-def _cache_metadata(bucket, real_requests, step, *, disjoint=False):
-    max_pages = _MAX_LENGTH // _BLOCK_SIZE
+def _cache_metadata(bucket, real_requests, step, block_size, *, disjoint=False):
+    max_pages = _MAX_LENGTH // block_size
     lengths = torch.zeros(bucket, dtype=torch.int32)
     prefixes = torch.zeros_like(lengths)
     table = torch.zeros((bucket, max_pages), dtype=torch.int32)
@@ -208,7 +207,7 @@ def _cache_metadata(bucket, real_requests, step, *, disjoint=False):
         length = sequence_lengths[(step + row) % len(sequence_lengths)]
         lengths[row] = length
         prefixes[row] = min(prefix, length) if row % 3 else 0
-        page_count = (length + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+        page_count = (length + block_size - 1) // block_size
         past_pages = page_count - 1
         if disjoint:
             table[row, :past_pages] = history[
@@ -220,11 +219,11 @@ def _cache_metadata(bucket, real_requests, step, *, disjoint=False):
             table[row, :past_pages] = shared[:past_pages]
         final_page = max_pages + (row + step) % bucket
         table[row, page_count - 1] = final_page
-        slots[row] = final_page * _BLOCK_SIZE + (length - 1) % _BLOCK_SIZE
+        slots[row] = final_page * block_size + (length - 1) % block_size
     return lengths, prefixes, table, slots
 
 
-def _reference(query, updates, initial_cache, lengths, prefixes, paged, slots, window):
+def _reference(query, updates, initial_cache, lengths, prefixes, paged, slots, window, block_size):
     """Apply token writes on CPU, then gather the permitted keys by position."""
     key_cache, value_cache = (tensor.clone() for tensor in initial_cache)
     keys, values = updates
@@ -232,7 +231,7 @@ def _reference(query, updates, initial_cache, lengths, prefixes, paged, slots, w
     for row, slot in enumerate(slots.tolist()):
         if slot < 0:
             continue
-        page, offset = divmod(slot, _BLOCK_SIZE)
+        page, offset = divmod(slot, block_size)
         key_cache[page, offset] = keys[row]
         value_cache[page, offset] = values[row]
     for row, length in enumerate(lengths.tolist()):
@@ -242,8 +241,8 @@ def _reference(query, updates, initial_cache, lengths, prefixes, paged, slots, w
         positions = torch.cat(
             (torch.arange(min(int(prefixes[row]), tail)), torch.arange(tail, length))
         )
-        pages = paged[row, positions // _BLOCK_SIZE]
-        offsets = positions % _BLOCK_SIZE
+        pages = paged[row, positions // block_size]
+        offsets = positions % block_size
         key = key_cache[pages, offsets].float()
         value = value_cache[pages, offsets].float()
         logits = torch.einsum("hd,thd->ht", query[row].float(), key) * _HEAD_DIM**-0.5
@@ -256,8 +255,9 @@ def _reference(query, updates, initial_cache, lengths, prefixes, paged, slots, w
     or not {"RANK", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"}.issubset(os.environ),
     reason="Requires one or two NPU processes launched with torchrun",
 )
+@pytest.mark.parametrize("block_size", [128, 256])
 @torch.inference_mode()
-def test_ocr_full_decode_updates_paged_rswa_graph(tp_group, monkeypatch):
+def test_ocr_full_decode_updates_paged_rswa_graph(tp_group, monkeypatch, block_size):
     from vllm.compilation.monitor import set_cudagraph_capturing_enabled
     from vllm.config import CUDAGraphMode, set_current_vllm_config
     from vllm.forward_context import (
@@ -310,7 +310,7 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group, monkeypatch):
         scheduler_config=SimpleNamespace(
             max_num_seqs=max(_CAPTURE_SIZES), enable_chunked_prefill=True
         ),
-        cache_config=SimpleNamespace(cache_dtype="auto"),
+        cache_config=SimpleNamespace(cache_dtype="auto", block_size=block_size),
         additional_config={},
         speculative_config=None,
         quant_config=None,
@@ -334,7 +334,7 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group, monkeypatch):
     )
     config.compilation_config.static_forward_context[layer_name] = layer
     spec = FullAttentionSpec(
-        block_size=_BLOCK_SIZE,
+        block_size=block_size,
         num_kv_heads=local_heads,
         head_size=_HEAD_DIM,
         dtype=_DTYPE,
@@ -344,11 +344,11 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group, monkeypatch):
     assert runtime.reserve_graph_memory(device) > 0
     runtime.bind_attention_groups([[SimpleNamespace(backend=backend)]])
 
-    pages = _MAX_LENGTH // _BLOCK_SIZE + max(_CAPTURE_SIZES)
+    pages = _MAX_LENGTH // block_size + max(_CAPTURE_SIZES)
     page_shape = (
-        (pages, local_heads, _BLOCK_SIZE, _HEAD_DIM)
+        (pages, local_heads, block_size, _HEAD_DIM)
         if head_major
-        else (pages, _BLOCK_SIZE, local_heads, _HEAD_DIM)
+        else (pages, block_size, local_heads, _HEAD_DIM)
     )
     initial_banks = tuple(
         torch.randn(
@@ -361,14 +361,14 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group, monkeypatch):
     if head_major:
         raw = torch.empty(pages * spec.page_size_bytes, dtype=torch.int8, device=device)
         logical_shape = backend.get_kv_cache_shape(
-            pages, _BLOCK_SIZE, local_heads, _HEAD_DIM
+            pages, block_size, local_heads, _HEAD_DIM
         )
         with set_current_vllm_config(config):
             order = backend.get_kv_cache_stride_order()
         kv_cache = _reshape_attention_kv_cache(
             raw, spec, logical_shape, order, pages, None
         )
-        assert kv_cache.shape == (2, pages, _BLOCK_SIZE, local_heads, _HEAD_DIM)
+        assert kv_cache.shape == (2, pages, block_size, local_heads, _HEAD_DIM)
         assert kv_cache.data_ptr() == raw.data_ptr() and kv_cache.nbytes == raw.nbytes
         physical_banks = raw.view(_DTYPE).view(2, *page_shape)
         initial_cache = tuple(bank.transpose(1, 2) for bank in initial_banks)
@@ -443,7 +443,7 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group, monkeypatch):
                 lengths = torch.ones(bucket, dtype=torch.int32)
                 prefixes = torch.zeros_like(lengths)
                 table = torch.zeros(
-                    (bucket, _MAX_LENGTH // _BLOCK_SIZE), dtype=torch.int32
+                    (bucket, _MAX_LENGTH // block_size), dtype=torch.int32
                 )
                 slots = torch.full((bucket,), -1, dtype=torch.int64)
                 live = metadata(
@@ -476,7 +476,7 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group, monkeypatch):
             cases.extend((64, live, True) for live in (64, 44, 43))
         for step, (bucket, real_requests, disjoint) in enumerate(cases, start=1):
             lengths, prefixes, table, slots = _cache_metadata(
-                bucket, real_requests, step, disjoint=disjoint
+                bucket, real_requests, step, block_size, disjoint=disjoint
             )
             live = metadata(bucket, real_requests, lengths, prefixes, table, slots)
             generator = torch.Generator().manual_seed(226 + step + rank * 31)
@@ -516,6 +516,7 @@ def test_ocr_full_decode_updates_paged_rswa_graph(tp_group, monkeypatch):
                 table,
                 slots,
                 window,
+                block_size,
             )
             # TP2 rounds to BF16 before HCCL. Its reference uses the CPU group.
             expected = expected.to(_DTYPE).float()

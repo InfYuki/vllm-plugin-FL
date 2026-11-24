@@ -253,22 +253,7 @@ R-SWA retains the full KV cache and uses a 2,048 MiB mask budget per rank.
 Prefix caching and speculative decoding are disabled. For single-device
 eager serving, use `--devices 0 --tp 1 --eager --max-num-seqs 4`.
 
-For the TP1 scheduling experiment, start `bash run_server.sh 2048` (port 19692)
-or `bash run_server.sh 1024` (port 19693). The argument sets the total token
-budget per scheduler step, shared by prefill and decode. Both settings use the
-BF16 head-major KV cache, grouped R-SWA, causal prefill, prefill MoE Top-6,
-64 active sequences and 0.95 device-memory utilization. Both use a 4096 MiB
-R-SWA mask limit so the 64 × 2048 configuration passes the launcher's check.
-The backend allocates masks for the current batch shape. The fused Top-6
-path remains eligible for unpadded 1024-row steps. Full 2048-row steps use the
-existing softmax and top-k path.
-
-After startup, run `bash run_perf.sh 4096 2048` from a second terminal in
-this checkout. The first argument selects the input text length (1024, 4096
-or 16384). The second selects the server budget and its port. For the
-control, restart on the same device with budget 1024 and pass 1024 as the
-second benchmark argument. Each run sends 1024 requests at concurrency 64
-with 1024 output tokens per request. `NUMBER=128` selects a short run.
+For the TP1 KV block-size comparison, follow the experiment instructions at the end of this README.
 
 To route the SiLU-and-multiply activation through the official FlagGems package,
 set `USE_FLAGGEMS=1 VLLM_FL_FLAGOS_WHITELIST=silu_and_mul` when launching the
@@ -407,18 +392,20 @@ If you want to use the original CUDA operators, you can set the following enviro
 export USE_FLAGGEMS=0
 ```
 
-## Unlimited-OCR TP1 expert prepack comparison
+## Unlimited-OCR TP1 KV block-size comparison
 
-Use the same Ascend device for both runs, one server at a time. Both modes use the C4 configuration (TP1, 64 sequences, a 2048-token batch budget and MTP disabled). The candidate sets `VLLM_FL_OCR_EXPERT_PREPACK=1` on port 19698. The baseline sets it to 0 on port 19699.
+Use the same Ascend device, one server at a time. The baseline uses 128 tokens per KV block on port 19701. The candidate uses 256 on port 19700. Both enable expert prepack, BF16 head-major KV, grouped R-SWA, causal prefill and prefill MoE Top-6. Both use TP1, 64 sequences, a 2048-token scheduler budget, a 4096 MiB mask limit and 0.95 device-memory utilization, with MTP disabled.
 
-Start the baseline from this checkout, then run the client in a second terminal in the same checkout after the model is ready.
+Start the baseline server and wait for it to become ready.
 
 ```bash
 bash run_server.sh baseline
 ```
 
+Run the client from a second terminal in this checkout.
+
 ```bash
 for n in 1024 4096 16384; do bash run_perf.sh "$n" baseline || break; done
 ```
 
-Stop the baseline, start `bash run_server.sh candidate`, and repeat the client loop with `candidate`. Each client run writes its own directory under `/workspace/results/tp1-expert-layout-<mode>-input-<length>-<timestamp>-<pid>`. Both modes use seed 42, concurrency 64 and 1024 output tokens. Compare successful request counts, output throughput, TTFT and TPOT at each length. Check identical greedy outputs on fixed prompts before interpreting timing differences.
+Stop the baseline server, start `bash run_server.sh candidate`, and repeat the client loop with `candidate`. Each run writes to `/workspace/results/tp1-kv-page256-<mode>-input-<length>-<timestamp>-<pid>`. Both modes use seed 42, concurrency 64 and 1024 output tokens. Compare successful requests, output throughput, TTFT and TPOT at each length after checking greedy output consistency on fixed prompts.

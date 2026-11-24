@@ -168,6 +168,12 @@ def refresh_block_size(vllm_config, block_size = 128):
     if not scheduler_config or not model_config:
         return
 
+    if cache_config.block_size == 256:
+        from vllm_fl.models.ocr_runtime import is_unlimited_ocr
+
+        if is_unlimited_ocr(model_config):
+            return
+
     # Hybrid state pages are aligned by the Mamba configuration verifier.
     if not model_config.is_hybrid and cache_config.block_size != block_size:
         if cache_config.enable_prefix_caching or scheduler_config.enable_chunked_prefill:

@@ -7894,6 +7894,10 @@ class ModelRunnerFL(
         kernel_block_sizes = prepare_kernel_block_sizes(
             kv_cache_config, self.attn_groups
         )
+        if self.ocr_rswa_window is not None and any(
+            size != self.cache_config.block_size for size in kernel_block_sizes
+        ):
+            raise ValueError("Unlimited-OCR requires unsplit KV cache pages")
         self._kernel_block_sizes = kernel_block_sizes
 
         # create metadata builders

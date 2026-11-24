@@ -55,8 +55,9 @@ def test_rswa_mask_matches_scalar_positions(monkeypatch, limit):
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_ocr_head_major_slots_preserve_pages_and_skip_padding(dtype):
-    pages, heads, block = 4, 10, 128
+@pytest.mark.parametrize("block", [128, 256])
+def test_ocr_head_major_slots_preserve_pages_and_skip_padding(dtype, block):
+    pages, heads = 4, 10
     logical = torch.tensor([3 * block + 1, -1, 0, block - 1, -1, block], dtype=dtype)
     slots = expand_head_major_slots(logical, heads, block).reshape(-1, heads)
     assert slots.dtype == torch.int32
