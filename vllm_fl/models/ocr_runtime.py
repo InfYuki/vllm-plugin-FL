@@ -146,6 +146,17 @@ def validate_ocr_config(config, *, device_type, vendor):
         or config.lora_config is not None
     ):
         raise ValueError("Unlimited-OCR supports ordinary TP1 or TP2 without LoRA")
+    sam_rel_pos = os.environ.get("VLLM_FL_OCR_SAM_REL_POS", "0")
+    if sam_rel_pos not in ("0", "1"):
+        raise ValueError("VLLM_FL_OCR_SAM_REL_POS must be 0 or 1")
+    extra = getattr(config, "additional_config", None)
+    if isinstance(extra, dict) and "ocr_sam_rel_pos" in extra:
+        if extra["ocr_sam_rel_pos"] is not (sam_rel_pos == "1"):
+            raise ValueError("ocr_sam_rel_pos must match VLLM_FL_OCR_SAM_REL_POS")
+    if sam_rel_pos == "1":
+        if extra is not None and not isinstance(extra, dict):
+            raise TypeError("OCR SAM relative-position tiling requires a dict additional_config")
+        config.additional_config = {**(extra or {}), "ocr_sam_rel_pos": True}
     extended_top6 = os.environ.get("VLLM_FL_OCR_EXTENDED_TOP6", "0")
     if extended_top6 not in ("0", "1"):
         raise ValueError("VLLM_FL_OCR_EXTENDED_TOP6 must be 0 or 1")

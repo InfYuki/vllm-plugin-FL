@@ -49,6 +49,7 @@ from vllm_fl.models.unlimited_ocr import UnlimitedOCRConfig
 
 logger = init_logger(__name__)
 _UNLIMITED_OCR_MAX_CROPS = 32
+_SAM_REL_POS_TILE_BYTES = 128 << 20
 
 
 def image_token_count(
@@ -265,6 +266,30 @@ class UnlimitedOCRMultiModalProcessor(DeepseekOCRMultiModalProcessor):
         return super()._cached_apply_hf_processor(inputs, timing_ctx)
 
 
+def _sam_attention_with_rel_pos(q, k, v, rel_h, rel_w, *, tiled):
+    batch, heads, tokens, _ = q.shape
+    # Keep all keys and queries of each image in one FIA call. Only partition
+    # the independent image/window axis, and preserve the BF16 bias addition.
+    bias_bytes_per_image = heads * tokens * tokens * q.element_size()
+    tile = max(1, _SAM_REL_POS_TILE_BYTES // bias_bytes_per_image) if tiled else batch
+    if tile >= batch:
+        bias = (rel_h + rel_w).reshape(batch, heads, tokens, tokens)
+        return scaled_dot_product_attention(q, k, v, bias)
+
+    outputs = []
+    for start in range(0, batch, tile):
+        end = min(start + tile, batch)
+        slices = slice(start * heads, end * heads)
+        bias = (rel_h[slices] + rel_w[slices]).reshape(end - start, heads, tokens, tokens)
+        outputs.append(scaled_dot_product_attention(q[start:end], k[start:end], v[start:end], bias))
+        del bias
+    logger.info_once(
+        "Unlimited-OCR SAM tiled relative bias: batch=%d, tile=%d, tokens=%d",
+        batch, tile, tokens,
+    )
+    return torch.cat(outputs, dim=0)
+
+
 def ocr_sam_forward(self: RelPosAttention, x: torch.Tensor) -> torch.Tensor:
     # Keep the native SAM projection and relative-position geometry.
     batch, height, width, _ = x.shape
@@ -272,20 +297,24 @@ def ocr_sam_forward(self: RelPosAttention, x: torch.Tensor) -> torch.Tensor:
     tokens = height * width
     qkv = self.qkv(x).reshape(batch, tokens, 3, heads, -1).permute(2, 0, 3, 1, 4)
     q, k, v = qkv.reshape(3, batch * heads, tokens, -1).unbind(0)
-    attn_bias = None
     if self.use_rel_pos:
         spatial_size = (height, width)
         rel_h, rel_w = add_decomposed_rel_pos(
             q, self.rel_pos_h, self.rel_pos_w, spatial_size, spatial_size
         )
-        attn_bias = (rel_h + rel_w).reshape(batch, heads, tokens, tokens)
-
-    output = scaled_dot_product_attention(
-        q.view(batch, heads, tokens, -1),
-        k.view(batch, heads, tokens, -1),
-        v.view(batch, heads, tokens, -1),
-        attn_bias,
-    )
+    q, k, v = (t.view(batch, heads, tokens, -1) for t in (q, k, v))
+    if self.use_rel_pos:
+        tiled = (
+            self._fl_tile_rel_pos and batch > 1 and tokens > 0
+            and q.device.type in ("npu", "privateuseone")
+            and q.dtype == rel_h.dtype == rel_w.dtype == torch.bfloat16
+            and heads == 12 and q.shape[-1] == 64
+        )
+        output = _sam_attention_with_rel_pos(
+            q, k, v, rel_h, rel_w, tiled=tiled
+        )
+    else:
+        output = scaled_dot_product_attention(q, k, v, None)
     output = (
         output.view(batch, heads, height, width, -1)
         .permute(0, 2, 3, 1, 4)
@@ -294,7 +323,7 @@ def ocr_sam_forward(self: RelPosAttention, x: torch.Tensor) -> torch.Tensor:
     return self.proj(output)
 
 
-def install_ocr_sam_attention(encoder: torch.nn.Module) -> None:
+def install_ocr_sam_attention(encoder: torch.nn.Module, *, tile_rel_pos: bool = False) -> None:
     """Bind before loading weights and preserve the encoder's module structure."""
     blocks = [
         layer for layer in encoder.modules() if isinstance(layer, RelPosAttention)
@@ -302,6 +331,7 @@ def install_ocr_sam_attention(encoder: torch.nn.Module) -> None:
     if not blocks:
         raise RuntimeError("Unlimited-OCR SAM attention layers were not found")
     for layer in blocks:
+        layer._fl_tile_rel_pos = tile_rel_pos
         layer.forward = MethodType(ocr_sam_forward, layer)
 
 
@@ -313,10 +343,13 @@ def install_ocr_sam_attention(encoder: torch.nn.Module) -> None:
 class UnlimitedOCRForCausalLM(DeepseekOCRForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        if not isinstance(self.sam_model, StageMissingLayer):
-            install_ocr_sam_attention(self.sam_model)
-
         extra = vllm_config.additional_config
+        if not isinstance(self.sam_model, StageMissingLayer):
+            install_ocr_sam_attention(
+                self.sam_model,
+                tile_rel_pos=isinstance(extra, dict) and extra.get("ocr_sam_rel_pos") is True,
+            )
+
         if isinstance(extra, dict) and extra.get("ocr_expert_prepack"):
             from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 

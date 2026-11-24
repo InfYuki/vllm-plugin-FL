@@ -392,25 +392,32 @@ If you want to use the original CUDA operators, you can set the following enviro
 export USE_FLAGGEMS=0
 ```
 
-## Unlimited-OCR TP1 R-SWA mask comparison
+## Unlimited-OCR TP1 SAM relative position bias comparison
 
-The candidate applies the valid-row path only when grouped attention falls back
-to a dense mask in an unpadded mixed step and at most one quarter of the query
-rows are valid. It fills padding with 1 and keeps the dense mask shape expected
-by FIA. The worker logs `FL R-SWA valid rows active` on first use.
+The candidate uses port 19724 and constructs the SAM relative position bias in
+whole-image batch tiles targeting 128 MiB per bias tensor. Each tile keeps all
+query and key positions for its images and uses the existing FIA operator. The
+baseline uses port 19725 and constructs the bias for the entire image batch.
+Both modes enable the R-SWA valid-query-row path, expanded softmax + Top-6,
+causal prefill, and BF16 expert prepacking. Use the same device for both modes.
+The shared configuration is TP1, 256-token KV pages, 64 sequences, a 2048-token
+scheduler budget, a 4096 MiB mask limit, and 0.95 device-memory utilization.
 
-Use the same Ascend device, one server at a time. The candidate uses port 19722 with valid-query-row mask construction for eligible mixed batches. The baseline uses port 19723 with the original mask construction. Both enable expanded softmax + Top-6 for single-token decode and eligible 2048-row prefill, plus the original 1024-row path. Both use TP1, BF16 expert prepack and head-major KV, 256-token KV pages, grouped R-SWA, causal prefill, 64 sequences, a 2048-token scheduler budget, a 4096 MiB mask limit, and 0.95 device-memory utilization. MTP is disabled.
-
-Start the baseline server and wait for it to become ready.
-
-```bash
-bash run_server.sh baseline
-```
-
-Run the client from a second terminal in this checkout.
+Start the candidate server on an available device.
 
 ```bash
-for n in 1024 4096 16384; do bash run_perf.sh "$n" baseline || break; done
+DEVICES=1 bash run_server.sh candidate
 ```
 
-Stop the baseline server, start `bash run_server.sh candidate`, and repeat the client loop with `candidate`. Each run writes to `/workspace/results/tp1-rswa-valid-rows-<mode>-input-<length>-<timestamp>-<pid>`. Both modes use seed 42, concurrency 64 and 1024 output tokens. Compare successful requests, total and output throughput, TTFT (including P99) and TPOT at each length after checking greedy output consistency on fixed prompts.
+After the server is ready, run the three input lengths from another terminal
+in the same worktree.
+
+```bash
+for n in 1024 4096 16384; do bash run_perf.sh "$n" candidate || break; done
+```
+
+For the comparison, stop the candidate server and replace `candidate` with
+`baseline` in both commands. Each run writes to
+`/workspace/results/tp1-sam-relpos-<mode>-input-<length>-<timestamp>-<pid>`.
+The benchmark uses seed 42, concurrency 64, and 1024 output tokens. Compare
+TTFT, total throughput, and greedy OCR output on fixed images.
