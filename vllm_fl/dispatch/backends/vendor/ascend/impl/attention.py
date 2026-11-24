@@ -595,6 +595,15 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                     max_kv_len=max_kv_len,
                     max_query_len=common_attn_metadata.max_query_len,
                     rswa_window=rswa_window,
+                    valid_rows_only=(
+                        self._get_mask_builder().ocr_mode
+                        and grouped == "1"
+                        and self.vllm_config.speculative_config is None
+                        and attn_state == AscendAttentionState.ChunkedPrefill
+                        and getattr(common_attn_metadata, "graph_pad_size", -1) < 0
+                        and num_actual_reqs == num_reqs_fia
+                        and os.getenv("VLLM_FL_OCR_RSWA_VALID_ROWS", "0") == "1"
+                    ),
                 )
 
         return AscendMetadata(

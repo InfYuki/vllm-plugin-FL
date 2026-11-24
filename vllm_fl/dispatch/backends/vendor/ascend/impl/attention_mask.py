@@ -7,12 +7,15 @@ This module provides utilities for creating and caching attention masks
 required by Ascend NPU attention operators.
 """
 
+import logging
 import os
+from itertools import groupby
 from typing import ClassVar, Optional
 
 import torch
 
 _RSWA_MASK_CHUNK_ELEMENTS = 1 << 24
+logger = logging.getLogger(__name__)
 
 
 class AttentionMaskBuilder:
@@ -72,6 +75,8 @@ class AttentionMaskBuilder:
         max_kv_len: int,
         max_query_len: int,
         rswa_window: int,
+        *,
+        valid_rows_only: bool = False,
     ) -> torch.Tensor:
         for name, size in (
             ("rswa_window", rswa_window),
@@ -93,6 +98,41 @@ class AttentionMaskBuilder:
             )
         if num_reqs * max_query_len * max_kv_len > int(limit) * (1 << 20):
             raise ValueError(f"R-SWA mask is too large: configured limit={limit} MiB")
+
+        if valid_rows_only and self.ocr_mode and query_lens.device.type == "cpu":
+            lengths = query_lens.reshape(-1).tolist()
+            if (
+                all(type(length) is int and 0 < length <= max_query_len for length in lengths)
+                and 4 * sum(lengths) <= num_reqs * max_query_len
+                and 1 in lengths
+                and any(length > 1 for length in lengths)
+            ):
+                mask = torch.ones(
+                    (num_reqs, 1, max_query_len, max_kv_len),
+                    dtype=torch.int8,
+                    device=self.device,
+                )
+                start = 0
+                for length, requests in groupby(lengths):
+                    end = start + sum(1 for _ in requests)
+                    mask[start:end, :, :length].copy_(
+                        self.get_rswa_attn_mask(
+                            prefix_lens.reshape(-1)[start:end],
+                            seq_lens.reshape(-1)[start:end],
+                            query_lens.reshape(-1)[start:end],
+                            max_kv_len,
+                            length,
+                            rswa_window,
+                        )
+                    )
+                    start = end
+                if not getattr(self, "_rswa_valid_rows_logged", False):
+                    logger.info(
+                        "FL R-SWA valid rows active: %d/%d query rows, KV width=%d",
+                        sum(lengths), num_reqs * max_query_len, max_kv_len,
+                    )
+                    self._rswa_valid_rows_logged = True
+                return mask
 
         prefix_lens, seq_lens, query_lens = (
             lens.to(device=self.device, dtype=torch.int64, non_blocking=True).reshape(

@@ -392,9 +392,14 @@ If you want to use the original CUDA operators, you can set the following enviro
 export USE_FLAGGEMS=0
 ```
 
-## Unlimited-OCR TP1 KV block-size comparison
+## Unlimited-OCR TP1 R-SWA mask comparison
 
-Use the same Ascend device, one server at a time. The candidate uses port 19720 and extends the existing 1024-row softmax + Top-6 to decode and unpadded 2048-row prefill/mixed steps. The baseline uses port 19721 and retains the 1024-row path. Both use 256-token KV pages, expert prepack, BF16 head-major KV, grouped R-SWA and causal prefill. Both use TP1, 64 sequences, a 2048-token scheduler budget, a 4096 MiB mask limit and 0.95 device-memory utilization, with MTP disabled.
+The candidate applies the valid-row path only when grouped attention falls back
+to a dense mask in an unpadded mixed step and at most one quarter of the query
+rows are valid. It fills padding with 1 and keeps the dense mask shape expected
+by FIA. The worker logs `FL R-SWA valid rows active` on first use.
+
+Use the same Ascend device, one server at a time. The candidate uses port 19722 with valid-query-row mask construction for eligible mixed batches. The baseline uses port 19723 with the original mask construction. Both enable expanded softmax + Top-6 for single-token decode and eligible 2048-row prefill, plus the original 1024-row path. Both use TP1, BF16 expert prepack and head-major KV, 256-token KV pages, grouped R-SWA, causal prefill, 64 sequences, a 2048-token scheduler budget, a 4096 MiB mask limit, and 0.95 device-memory utilization. MTP is disabled.
 
 Start the baseline server and wait for it to become ready.
 
@@ -408,4 +413,4 @@ Run the client from a second terminal in this checkout.
 for n in 1024 4096 16384; do bash run_perf.sh "$n" baseline || break; done
 ```
 
-Stop the baseline server, start `bash run_server.sh candidate`, and repeat the client loop with `candidate`. Each run writes to `/workspace/results/tp1-kv-page256-<mode>-input-<length>-<timestamp>-<pid>`. Both modes use seed 42, concurrency 64 and 1024 output tokens. Compare successful requests, output throughput, TTFT and TPOT at each length after checking greedy output consistency on fixed prompts.
+Stop the baseline server, start `bash run_server.sh candidate`, and repeat the client loop with `candidate`. Each run writes to `/workspace/results/tp1-rswa-valid-rows-<mode>-input-<length>-<timestamp>-<pid>`. Both modes use seed 42, concurrency 64 and 1024 output tokens. Compare successful requests, total and output throughput, TTFT (including P99) and TPOT at each length after checking greedy output consistency on fixed prompts.

@@ -6,8 +6,8 @@ mode=${1:-candidate}
 usage='Usage: bash run_server.sh [candidate|baseline] (both use a 2048-token budget)'
 if (( $# > 1 )); then echo "$usage" >&2; exit 2; fi
 case "$mode" in
-  candidate) extended_top6=1; default_port=19720 ;;
-  baseline)  extended_top6=0; default_port=19721 ;;
+  candidate) valid_rows=1; default_port=19722 ;;
+  baseline)  valid_rows=0; default_port=19723 ;;
   *) echo "$usage" >&2; exit 2 ;;
 esac
 port=${PORT:-$default_port}
@@ -23,7 +23,8 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export VLLM_FL_RSWA_GROUPED_MASK=1 VLLM_FL_RSWA_CAUSAL_PREFILL=1
 export VLLM_FL_OCR_PREFILL_MOE_TOP6=1 VLLM_FL_OCR_HEAD_MAJOR_KV=1
 export VLLM_FL_OCR_EXPERT_PREPACK=1
-export VLLM_FL_OCR_EXTENDED_TOP6="$extended_top6"
+export VLLM_FL_OCR_EXTENDED_TOP6=1
+export VLLM_FL_OCR_RSWA_VALID_ROWS="$valid_rows"
 
 python -P - <<'PY'
 from importlib.util import find_spec
@@ -34,8 +35,8 @@ expected = Path.cwd() / "vllm_fl" / "__init__.py"
 if spec is None or not spec.origin or Path(spec.origin).resolve() != expected:
     raise SystemExit(f"Expected FL at {expected}. Python resolved {spec!r}")
 PY
-printf 'FL=%s mode=%s TP=1 device=%s port=%s seqs=%s budget=%s mask_MiB=%s block_size=%s extended_top6=%s memory=0.95\n' \
-  "$PWD" "$mode" "$devices" "$port" "$seqs" "$budget" "$mask_mib" "$block_size" "$extended_top6"
+printf 'FL=%s mode=%s TP=1 device=%s port=%s seqs=%s budget=%s mask_MiB=%s block_size=%s extended_top6=1 rswa_valid_rows=%s memory=0.95\n' \
+  "$PWD" "$mode" "$devices" "$port" "$seqs" "$budget" "$mask_mib" "$block_size" "$valid_rows"
 exec python examples/unlimited_ocr/serve.py /public-flash/models/q4_models/Unlimited-OCR \
   --devices "$devices" --tp 1 --block-size "$block_size" --port "$port" \
   --max-num-seqs "$seqs" --max-num-batched-tokens "$budget" --rswa-mask-mib "$mask_mib" \
