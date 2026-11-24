@@ -146,6 +146,21 @@ def validate_ocr_config(config, *, device_type, vendor):
         or config.lora_config is not None
     ):
         raise ValueError("Unlimited-OCR supports ordinary TP1 or TP2 without LoRA")
+    extended_top6 = os.environ.get("VLLM_FL_OCR_EXTENDED_TOP6", "0")
+    if extended_top6 not in ("0", "1"):
+        raise ValueError("VLLM_FL_OCR_EXTENDED_TOP6 must be 0 or 1")
+    extra = getattr(config, "additional_config", None)
+    if isinstance(extra, dict) and "ocr_extended_top6" in extra:
+        if extra["ocr_extended_top6"] is not (extended_top6 == "1"):
+            raise ValueError("ocr_extended_top6 must match VLLM_FL_OCR_EXTENDED_TOP6")
+    if extended_top6 == "1":
+        if parallel.tensor_parallel_size != 1:
+            raise ValueError("Extended OCR Top-6 requires TP1")
+        if os.environ.get("VLLM_FL_OCR_PREFILL_MOE_TOP6") != "1":
+            raise ValueError("Extended OCR Top-6 requires VLLM_FL_OCR_PREFILL_MOE_TOP6=1")
+        if extra is not None and not isinstance(extra, dict):
+            raise TypeError("Extended OCR Top-6 requires a dict additional_config")
+        config.additional_config = {**(extra or {}), "ocr_extended_top6": True}
     prepack = os.environ.get("VLLM_FL_OCR_EXPERT_PREPACK", "0")
     if prepack not in ("0", "1"):
         raise ValueError("VLLM_FL_OCR_EXPERT_PREPACK must be 0 or 1")

@@ -394,7 +394,7 @@ export USE_FLAGGEMS=0
 
 ## Unlimited-OCR TP1 KV block-size comparison
 
-Use the same Ascend device, one server at a time. The baseline uses 128 tokens per KV block on port 19701. The candidate uses 256 on port 19700. Both enable expert prepack, BF16 head-major KV, grouped R-SWA, causal prefill and prefill MoE Top-6. Both use TP1, 64 sequences, a 2048-token scheduler budget, a 4096 MiB mask limit and 0.95 device-memory utilization, with MTP disabled.
+Use the same Ascend device, one server at a time. The candidate uses port 19720 and extends the existing 1024-row softmax + Top-6 to decode and unpadded 2048-row prefill/mixed steps. The baseline uses port 19721 and retains the 1024-row path. Both use 256-token KV pages, expert prepack, BF16 head-major KV, grouped R-SWA and causal prefill. Both use TP1, 64 sequences, a 2048-token scheduler budget, a 4096 MiB mask limit and 0.95 device-memory utilization, with MTP disabled.
 
 Start the baseline server and wait for it to become ready.
 

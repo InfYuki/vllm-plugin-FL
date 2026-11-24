@@ -546,6 +546,12 @@ class ModelRunnerFL(
             if self.ocr_rswa_window is not None and self.use_ascend_attention
             and self.parallel_config.tensor_parallel_size == 1 else None
         )
+        extra = getattr(vllm_config, "additional_config", None)
+        self.ocr_extended_top6 = (
+            self.ocr_prefill_top6 is not None
+            and isinstance(extra, dict)
+            and extra.get("ocr_extended_top6") is True
+        )
         self.graph_runtime = None
         if self.use_ascend_attention:
             from vllm_fl.compilation.graph_runtime import GraphRuntimeController
@@ -4635,8 +4641,17 @@ class ModelRunnerFL(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            # Only the measured, unpadded 1024-token live prefill/mixed step.
-            # Decode, speculative steps, graph capture and dummy runs stay unchanged.
+            uniform_decode = (
+                max_num_scheduled_tokens == 1 and num_tokens_unpadded == num_reqs
+            )
+            prefill_2048 = (
+                cudagraph_mode == CUDAGraphMode.NONE
+                and max_num_scheduled_tokens > 1
+                and num_tokens_unpadded == num_tokens_padded == 2048
+            )
+            if self.ocr_extended_top6 and (uniform_decode or prefill_2048):
+                get_forward_context().additional_kwargs["ocr_extended_top6"] = True
+            # Keep the existing unpadded 1024-token live prefill/mixed path.
             if (
                 self.ocr_prefill_top6 is not None
                 and cudagraph_mode == CUDAGraphMode.NONE
@@ -6340,6 +6355,9 @@ class ModelRunnerFL(
                     slot_mapping=slot_mappings,
                 ),
             ):
+                # FULL decode replays this branch without another Python forward.
+                if self.ocr_extended_top6 and uniform_decode:
+                    get_forward_context().additional_kwargs["ocr_extended_top6"] = True
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -7894,10 +7912,12 @@ class ModelRunnerFL(
         kernel_block_sizes = prepare_kernel_block_sizes(
             kv_cache_config, self.attn_groups
         )
-        if self.ocr_rswa_window is not None and any(
-            size != self.cache_config.block_size for size in kernel_block_sizes
-        ):
-            raise ValueError("Unlimited-OCR requires unsplit KV cache pages")
+        if self.ocr_rswa_window is not None:
+            requested = getattr(self.cache_config, "_fl_ocr_block_size", self.cache_config.block_size)
+            if (requested != self.cache_config.block_size or not kernel_block_sizes
+                    or any(size != requested for size in kernel_block_sizes)):
+                raise ValueError(f"Unlimited-OCR requested {requested}-token KV pages, "
+                                 f"cache={self.cache_config.block_size}, kernels={kernel_block_sizes}")
         self._kernel_block_sizes = kernel_block_sizes
 
         # create metadata builders

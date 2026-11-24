@@ -168,11 +168,20 @@ def refresh_block_size(vllm_config, block_size = 128):
     if not scheduler_config or not model_config:
         return
 
-    if cache_config.block_size == 256:
+    if cache_config.block_size in (128, 256):
         from vllm_fl.models.ocr_runtime import is_unlimited_ocr
 
         if is_unlimited_ocr(model_config):
-            return
+            # with_hf_config replaces ModelConfig but shares this CacheConfig.
+            if not hasattr(cache_config, "_fl_ocr_block_size"):
+                cache_config._fl_ocr_block_size = cache_config.block_size
+
+    expected = getattr(cache_config, "_fl_ocr_block_size", None)
+    if expected is not None:
+        if cache_config.block_size != expected:
+            raise ValueError(f"Unlimited-OCR requested {expected}-token KV pages, "
+                             f"got {cache_config.block_size}")
+        return
 
     # Hybrid state pages are aligned by the Mamba configuration verifier.
     if not model_config.is_hybrid and cache_config.block_size != block_size:

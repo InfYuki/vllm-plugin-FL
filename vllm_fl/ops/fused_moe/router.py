@@ -23,6 +23,7 @@ from vllm_fl.dispatch import CachedOp
 
 _topk_softmax = CachedOp("topk_softmax")
 _grouped_topk = CachedOp("grouped_topk")
+_ocr_extended_top6 = CachedOp("softmax_topk_unbiased")
 
 def fused_topk(
     hidden_states: torch.Tensor,
@@ -125,7 +126,7 @@ def _fl_grouped_topk(
         return topk_values, topk_indices
 
     if (
-        gating_output.shape == (1024, 64)
+        gating_output.ndim == 2 and gating_output.shape[1] == 64
         and gating_output.device.type in ("npu", "privateuseone")
         and gating_output.dtype in (torch.bfloat16, torch.float32)
         and gating_output.is_contiguous()
@@ -134,7 +135,10 @@ def _fl_grouped_topk(
         and not renormalize and routed_scaling_factor == 1.0
         and is_forward_context_available()
     ):
-        fused = get_forward_context().additional_kwargs.get("ocr_prefill_top6")
+        options = get_forward_context().additional_kwargs
+        if options.get("ocr_extended_top6"):
+            return _ocr_extended_top6(gating_output, topk)
+        fused = options.get("ocr_prefill_top6") if gating_output.shape[0] == 1024 else None
         if fused is not None:
             return fused(gating_output, topk)
 
