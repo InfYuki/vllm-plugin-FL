@@ -552,6 +552,7 @@ class ModelRunnerFL(
             and isinstance(extra, dict)
             and extra.get("ocr_extended_top6") is True
         )
+        self.ocr_top6_4096 = self.ocr_extended_top6 and extra.get("ocr_top6_4096") is True
         self.graph_runtime = None
         if self.use_ascend_attention:
             from vllm_fl.compilation.graph_runtime import GraphRuntimeController
@@ -4644,12 +4645,13 @@ class ModelRunnerFL(
             uniform_decode = (
                 max_num_scheduled_tokens == 1 and num_tokens_unpadded == num_reqs
             )
-            prefill_2048 = (
+            extended_prefill = (
                 cudagraph_mode == CUDAGraphMode.NONE
                 and max_num_scheduled_tokens > 1
-                and num_tokens_unpadded == num_tokens_padded == 2048
+                and num_tokens_unpadded == num_tokens_padded
+                and (num_tokens_padded == 2048 or (self.ocr_top6_4096 and num_tokens_padded == 4096))
             )
-            if self.ocr_extended_top6 and (uniform_decode or prefill_2048):
+            if self.ocr_extended_top6 and (uniform_decode or extended_prefill):
                 get_forward_context().additional_kwargs["ocr_extended_top6"] = True
             # Keep the existing unpadded 1024-token live prefill/mixed path.
             if (

@@ -4,6 +4,7 @@
 import torch
 from functools import partial
 
+from vllm.logger import init_logger
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
@@ -21,6 +22,8 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
 )
 from vllm_fl.dispatch import CachedOp
 
+logger = init_logger(__name__)
+_ocr_top6_4096_calls = None
 _topk_softmax = CachedOp("topk_softmax")
 _grouped_topk = CachedOp("grouped_topk")
 _ocr_extended_top6 = CachedOp("softmax_topk_unbiased")
@@ -137,7 +140,18 @@ def _fl_grouped_topk(
     ):
         options = get_forward_context().additional_kwargs
         if options.get("ocr_extended_top6"):
-            return _ocr_extended_top6(gating_output, topk)
+            result = _ocr_extended_top6(gating_output, topk)
+            if gating_output.shape[0] == 4096:
+                global _ocr_top6_4096_calls
+                if _ocr_top6_4096_calls is None:
+                    from prometheus_client import Counter
+
+                    _ocr_top6_4096_calls = Counter(
+                        "fl_ocr_top6_4096_calls", "4096-row fused OCR Top-6 dispatches"
+                    )
+                    logger.info("FL OCR extended Top-6 dispatched for 4096 rows")
+                _ocr_top6_4096_calls.inc()
+            return result
         fused = options.get("ocr_prefill_top6") if gating_output.shape[0] == 1024 else None
         if fused is not None:
             return fused(gating_output, topk)

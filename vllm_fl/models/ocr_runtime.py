@@ -153,6 +153,14 @@ def validate_ocr_config(config, *, device_type, vendor):
     if isinstance(extra, dict) and "ocr_extended_top6" in extra:
         if extra["ocr_extended_top6"] is not (extended_top6 == "1"):
             raise ValueError("ocr_extended_top6 must match VLLM_FL_OCR_EXTENDED_TOP6")
+    wide_top6 = os.environ.get("VLLM_FL_OCR_TOP6_4096", "0")
+    if wide_top6 not in ("0", "1"):
+        raise ValueError("VLLM_FL_OCR_TOP6_4096 must be 0 or 1")
+    if isinstance(extra, dict) and "ocr_top6_4096" in extra:
+        if extra["ocr_top6_4096"] is not (wide_top6 == "1"):
+            raise ValueError("ocr_top6_4096 must match VLLM_FL_OCR_TOP6_4096")
+    if wide_top6 == "1" and extended_top6 != "1":
+        raise ValueError("OCR 4096-row Top-6 requires VLLM_FL_OCR_EXTENDED_TOP6=1")
     if extended_top6 == "1":
         if parallel.tensor_parallel_size != 1:
             raise ValueError("Extended OCR Top-6 requires TP1")
@@ -161,6 +169,8 @@ def validate_ocr_config(config, *, device_type, vendor):
         if extra is not None and not isinstance(extra, dict):
             raise TypeError("Extended OCR Top-6 requires a dict additional_config")
         config.additional_config = {**(extra or {}), "ocr_extended_top6": True}
+        if wide_top6 == "1":
+            config.additional_config["ocr_top6_4096"] = True
     prepack = os.environ.get("VLLM_FL_OCR_EXPERT_PREPACK", "0")
     if prepack not in ("0", "1"):
         raise ValueError("VLLM_FL_OCR_EXPERT_PREPACK must be 0 or 1")
