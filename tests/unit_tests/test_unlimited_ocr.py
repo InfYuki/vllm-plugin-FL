@@ -217,3 +217,38 @@ def test_ocr_flaggems_whitelist(monkeypatch, enabled, whitelist, accepted):
     else:
         with pytest.raises(ValueError, match="FlagGems|FLAGOS_WHITELIST"):
             _ocr_flaggems_silu()
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_rswa_skip_hidden_pages_preserves_read_tokens(reverse):
+    from types import SimpleNamespace
+
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.attention import _stage_rswa_read_view
+
+    rows = [(6010, 6999), (6010, 7011), (2938, 4000), (6010, 6011), (8192, 9400)]
+    if reverse:
+        rows.reverse()
+    prefixes, lengths = map(list, zip(*rows))
+    lengths.append(1)  # FULL bucket padding with no real request.
+    block, width, window = 256, 10240, 128
+    pages = width // block
+    keys = torch.arange(width)
+    mask = torch.ones(len(lengths), 1, 1, width, dtype=torch.int8)
+    for i, (prefix, length) in enumerate(rows):
+        mask[i] = ~((keys < prefix) | ((keys >= length - window) & (keys < length)))
+    table = torch.randperm(len(lengths) * pages).reshape(len(lengths), pages)
+    live = SimpleNamespace(seq_lens_list=lengths, rswa_read_prefixes=prefixes,
+                           kv_block_size=block, rswa_window=window,
+                           attn_mask=mask, block_tables=table)
+    stage_mask, stage_table = mask.clone(), table.clone()
+    compact = _stage_rswa_read_view(stage_mask, stage_table, live)
+    for row, length in enumerate(lengths):
+        skip = 2 if length in (6999, 7011) else 0
+        # ceil(6010/256)=24, floor((6999-128)/256)=26.
+        assert compact[row] == length - skip * block
+        actual = stage_table[row, keys // block] * block + keys % block
+        expected = table[row, keys // block] * block + keys % block
+        torch.testing.assert_close(actual[stage_mask[row].flatten() == 0],
+                                   expected[mask[row].flatten() == 0])
+        assert stage_mask[row, ..., compact[row]:].all()
+    live.rswa_read_prefixes = []
+    assert _stage_rswa_read_view(mask.clone(), table.clone(), live) is lengths

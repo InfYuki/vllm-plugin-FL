@@ -28,7 +28,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from itertools import accumulate
+from itertools import accumulate, groupby
 from typing import Any, ClassVar, List, Optional, Tuple, Type
 
 import torch
@@ -227,6 +227,47 @@ def _rswa_mask_request_lengths(
     return prefix_lens, query_lens
 
 
+def _stage_rswa_read_view(mask, table, live):
+    """Move complete hidden pages out of the FIA read view only."""
+    lengths = live.seq_lens_list
+    prefixes = getattr(live, "rswa_read_prefixes", None)
+    if not prefixes:
+        return lengths
+    block = live.kv_block_size
+    spans = []
+    for prefix, length in zip(prefixes, lengths):
+        first = cdiv(prefix, block)
+        stop = (length - live.rswa_window) // block
+        spans.append((first, stop) if 4096 <= prefix < 8192 and first < stop else None)
+    # Avoid launching a series of tiny device copies for fragmented batches.
+    if not any(spans) or sum(span is not None for span, _ in groupby(spans)) > 4:
+        return lengths
+
+    compact = lengths.copy()
+    # Bucket rows with the same gap so a uniform decode batch only issues a
+    # single run of updates, even when requests differ in output length.
+    start = 0
+    for span, rows in groupby(spans):
+        end = start + sum(1 for _ in rows)
+        if span is not None:
+            first, stop = span
+            skip = stop - first
+            tokens = skip * block
+            last = max(lengths[start:end])
+            pages = cdiv(last, block)
+            batch = slice(start, end)
+            table[batch, first : pages - skip].copy_(
+                live.block_tables[batch, stop:pages]
+            )
+            mask[batch, ..., first * block : last - tokens].copy_(
+                live.attn_mask[batch, ..., stop * block : last]
+            )
+            mask[batch, ..., last - tokens : last].fill_(1)
+            compact[start:end] = [n - tokens for n in lengths[start:end]]
+        start = end
+    return compact
+
+
 class AscendAttentionState(Enum):
     """Attention state for Ascend backend."""
     PrefillNoCache = 0
@@ -356,6 +397,7 @@ class AscendMetadata:
     rswa_window: int | None = None
     rswa_groups: tuple[RswaAttentionGroup, ...] | None = None
 
+    rswa_read_prefixes: list[int] | None = None
     causal: bool = True
     model_runner_type: str = ""
     ocr_head_major_kv: bool = False
@@ -382,6 +424,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.device = device
+        self.skip_hidden_pages = os.getenv("VLLM_FL_OCR_SKIP_HIDDEN_PAGES") == "1"
         self.ocr_head_major_kv = ocr_head_major_kv_enabled(vllm_config)
         if self.ocr_head_major_kv and kv_cache_spec is not None:
             logger.info(
@@ -511,6 +554,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         rswa_window = get_ocr_rswa_window(self.model_config)
         rswa_groups = None
+        read_prefixes = None
         if rswa_window is not None:
             rswa_prefix_lens = getattr(common_attn_metadata, "rswa_prefix_lens", None)
             max_kv_len = self.model_config.max_model_len
@@ -541,6 +585,16 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             rswa_prefix_lens, rswa_query_lens = _rswa_mask_request_lengths(
                 rswa_prefix_lens, query_lens, num_actual_reqs
             )
+            if (
+                getattr(self, "skip_hidden_pages", False)
+                and self.ocr_head_major_kv
+                and self.kv_block_size == 256
+                and attn_state == AscendAttentionState.DecodeOnly
+                and self.vllm_config.speculative_config is None
+                and num_actual_reqs
+                and rswa_prefix_lens.device.type == "cpu"
+            ):
+                read_prefixes = rswa_prefix_lens[:num_actual_reqs].tolist()
             grouped = os.environ.get("VLLM_FL_RSWA_GROUPED_MASK", "1")
             if grouped not in ("0", "1"):
                 raise ValueError("VLLM_FL_RSWA_GROUPED_MASK must be 0 or 1")
@@ -624,6 +678,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             model_runner_type=self.model_config.runner_type,
             rswa_window=rswa_window,
             rswa_groups=rswa_groups,
+            rswa_read_prefixes=read_prefixes,
             ocr_head_major_kv=self.ocr_head_major_kv,
             kv_block_size=self.kv_block_size,
         )
@@ -955,6 +1010,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 raise RuntimeError(f"R-SWA graph {label} layout changed")
         mask.copy_(live.attn_mask)
         table.copy_(live.block_tables)
+        lengths = _stage_rswa_read_view(mask, table, live)
+        forward_context.rswa_read_lengths = lengths
+        if lengths is not live.seq_lens_list and not params.skip_pages_logged:
+            logger.info(
+                "FL OCR FULL decode skipped hidden pages: removed=%d page_size=%d",
+                (sum(live.seq_lens_list) - sum(lengths)) // block_size, block_size,
+            )
+            params.skip_pages_logged = True
 
     @staticmethod
     def update_graph_params(
@@ -1055,7 +1118,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         input_layout="TND",
                         block_size=param.block_size,
                         actual_seq_lengths=live.actual_seq_lengths_q,
-                        actual_seq_lengths_kv=live.seq_lens_list,
+                        actual_seq_lengths_kv=getattr(
+                            forward_context, "rswa_read_lengths", live.seq_lens_list
+                        ),
                         num_key_value_heads=param.num_kv_heads,
                         num_heads=param.num_heads,
                         scale=param.scale,
@@ -1310,6 +1375,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 raise RuntimeError(
                     "R-SWA graph inputs and workspace must be reserved before capture"
                 )
+            actual_seq_lengths_kv = getattr(context, "rswa_read_lengths", actual_seq_lengths_kv)
             attn_mask, block_table = context.rswa_graph_inputs
             sparse_mode = 0
             pre_tokens = next_tokens = _SWA_INT_MAX
