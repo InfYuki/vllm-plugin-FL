@@ -35,7 +35,8 @@ sample_hbm() {
   while :; do
     stamp=$(date +%s)
     timeout 5 npu-smi info | awk -F'|' -v t="$stamp" '
-      $3 ~ /[[:xdigit:]]{4}:[[:xdigit:]]{2}:/ {
+      $3 ~ /[[:xdigit:]][[:xdigit:]]:[[:xdigit:]][[:xdigit:]]:/ {
+        gsub(/\//, " / ", $4)
         split($2, chip, " "); split($4, usage, " ")
         if (chip[2] ~ /^[0-9]+$/ && usage[5] ~ /^[0-9]+$/ && usage[6] == "/")
           print t, chip[2], usage[5], usage[7]
