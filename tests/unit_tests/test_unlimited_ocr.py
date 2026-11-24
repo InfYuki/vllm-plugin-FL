@@ -218,19 +218,23 @@ def test_ocr_flaggems_whitelist(monkeypatch, enabled, whitelist, accepted):
         with pytest.raises(ValueError, match="FlagGems|FLAGOS_WHITELIST"):
             _ocr_flaggems_silu()
 
+
+@pytest.mark.parametrize("fragmented", [False, True])
 @pytest.mark.parametrize("reverse", [False, True])
-def test_rswa_skip_hidden_pages_preserves_read_tokens(reverse):
+def test_rswa_skip_hidden_pages_preserves_read_tokens(reverse, fragmented):
     from types import SimpleNamespace
 
     from vllm_fl.dispatch.backends.vendor.ascend.impl.attention import _stage_rswa_read_view
 
     rows = [(6010, 6999), (6010, 7011), (2938, 4000), (6010, 6011), (8192, 9400)]
+    if fragmented:
+        rows *= 5
     if reverse:
         rows.reverse()
     prefixes, lengths = map(list, zip(*rows))
     lengths.append(1)  # FULL bucket padding with no real request.
-    block, width, window = 256, 10240, 128
-    pages = width // block
+    block, width, window = 256, 10005, 128
+    pages = 42  # Include an incomplete mask page and excess table columns.
     keys = torch.arange(width)
     mask = torch.ones(len(lengths), 1, 1, width, dtype=torch.int8)
     for i, (prefix, length) in enumerate(rows):

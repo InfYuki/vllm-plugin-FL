@@ -239,11 +239,35 @@ def _stage_rswa_read_view(mask, table, live):
         first = cdiv(prefix, block)
         stop = (length - live.rswa_window) // block
         spans.append((first, stop) if 4096 <= prefix < 8192 and first < stop else None)
-    # Avoid launching a series of tiny device copies for fragmented batches.
-    if not any(spans) or sum(span is not None for span, _ in groupby(spans)) > 4:
+    if not any(spans):
         return lengths
 
     compact = lengths.copy()
+    if sum(span is not None for span, _ in groupby(spans)) > 4:
+        # Rotate each fully masked gap to the end. One index vector stages
+        # both inputs for all rows, including identity maps for bucket padding.
+        pages = table.shape[1]
+        spans.extend([None] * (len(lengths) - len(spans)))
+        first = [span[0] if span else 0 for span in spans]
+        skips = [span[1] - span[0] if span else 0 for span in spans]
+        compact = [n - skip * block for n, skip in zip(lengths, skips)]
+        first = torch.tensor(first).unsqueeze(1)
+        skips = torch.tensor(skips).unsqueeze(1)
+        columns = torch.arange(pages)
+        shifted = columns + skips
+        source_page = torch.where(shifted < pages, shifted, first + shifted - pages)
+        indices = torch.where(columns < first, columns, source_page)
+        indices += torch.arange(len(lengths)).unsqueeze(1) * pages
+        indices = indices.flatten().to(table.device)
+        table.copy_(live.block_tables.flatten().index_select(0, indices).view_as(table))
+        width = mask.shape[-1]
+        source = live.attn_mask
+        if width < pages * block:
+            source = torch.nn.functional.pad(source, (0, pages * block - width), value=1)
+        ordered = source.reshape(-1, block).index_select(0, indices)
+        mask.copy_(ordered.view(len(lengths), 1, 1, -1)[..., :width])
+        return compact
+
     # Bucket rows with the same gap so a uniform decode batch only issues a
     # single run of updates, even when requests differ in output length.
     start = 0
@@ -397,11 +421,11 @@ class AscendMetadata:
     rswa_window: int | None = None
     rswa_groups: tuple[RswaAttentionGroup, ...] | None = None
 
-    rswa_read_prefixes: list[int] | None = None
     causal: bool = True
     model_runner_type: str = ""
     ocr_head_major_kv: bool = False
     kv_block_size: int = 128
+    rswa_read_prefixes: list[int] | None = None
 
 
 
@@ -1012,7 +1036,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         table.copy_(live.block_tables)
         lengths = _stage_rswa_read_view(mask, table, live)
         forward_context.rswa_read_lengths = lengths
-        if lengths is not live.seq_lens_list and not params.skip_pages_logged:
+        if (
+            lengths is not live.seq_lens_list
+            and not getattr(forward_context, "capturing", False)
+            and not params.skip_pages_logged
+        ):
             logger.info(
                 "FL OCR FULL decode skipped hidden pages: removed=%d page_size=%d",
                 (sum(live.seq_lens_list) - sum(lengths)) // block_size, block_size,
