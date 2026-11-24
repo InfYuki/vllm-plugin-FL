@@ -3,12 +3,13 @@ set -euo pipefail
 cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
 mode=${1:-candidate}
-usage='Usage: bash run_server.sh [candidate|mask-control|baseline]'
+usage='Usage: bash run_server.sh [candidate|baseline]'
 if (( $# > 1 )); then echo "$usage" >&2; exit 2; fi
+budget=4096
+mask_mib=8192
 case "$mode" in
-  candidate)    default_port=19728; budget=4096; mask_mib=8192 ;;
-  mask-control) default_port=19729; budget=2048; mask_mib=8192 ;;
-  baseline)     default_port=19730; budget=2048; mask_mib=4096 ;;
+  candidate) default_port=19731 ;;
+  baseline)  default_port=19732 ;;
   *) echo "$usage" >&2; exit 2 ;;
 esac
 port=${PORT:-$default_port}
@@ -23,8 +24,9 @@ export VLLM_FL_RSWA_GROUPED_MASK=1 VLLM_FL_RSWA_CAUSAL_PREFILL=1
 export VLLM_FL_OCR_PREFILL_MOE_TOP6=1 VLLM_FL_OCR_HEAD_MAJOR_KV=1
 export VLLM_FL_OCR_EXPERT_PREPACK=1
 export VLLM_FL_OCR_EXTENDED_TOP6=1
-export VLLM_FL_OCR_TOP6_4096=0
-if [[ $mode == candidate ]]; then export VLLM_FL_OCR_TOP6_4096=1; fi
+export VLLM_FL_OCR_TOP6_4096=1
+export VLLM_FL_OCR_SKIP_HIDDEN_PAGES=0
+if [[ $mode == candidate ]]; then export VLLM_FL_OCR_SKIP_HIDDEN_PAGES=1; fi
 export VLLM_FL_OCR_RSWA_VALID_ROWS=1
 
 python -P - <<'PY'
@@ -36,8 +38,8 @@ expected = Path.cwd() / "vllm_fl" / "__init__.py"
 if spec is None or not spec.origin or Path(spec.origin).resolve() != expected:
     raise SystemExit(f"Expected FL at {expected}. Python resolved {spec!r}")
 PY
-printf 'FL=%s mode=%s TP=1 device=%s port=%s seqs=%s budget=%s mask_MiB=%s block_size=%s extended_top6=1 rswa_valid_rows=1 sam_rel_pos=0 memory=0.95\n' \
-  "$PWD" "$mode" "$devices" "$port" "$seqs" "$budget" "$mask_mib" "$block_size"
+printf 'FL=%s mode=%s TP=1 device=%s port=%s seqs=%s budget=%s mask_MiB=%s block_size=%s skip_hidden_pages=%s extended_top6=1 rswa_valid_rows=1 sam_rel_pos=0 memory=0.95\n' \
+  "$PWD" "$mode" "$devices" "$port" "$seqs" "$budget" "$mask_mib" "$block_size" "$VLLM_FL_OCR_SKIP_HIDDEN_PAGES"
 # Set before Python imports prometheus_client so worker counters reach /metrics.
 metrics_dir=$(mktemp -d)
 export PROMETHEUS_MULTIPROC_DIR="$metrics_dir"
