@@ -1,0 +1,121 @@
+diff --git a/vllm_ascend/models/qwen4_exp/model_state.py b/vllm_ascend/models/qwen4_exp/model_state.py
+--- a/vllm_ascend/models/qwen4_exp/model_state.py
++++ b/vllm_ascend/models/qwen4_exp/model_state.py
+@@ -21,10 +21,12 @@
+ import torch
+ import torch.nn as nn
+ from vllm.config import VllmConfig
++from vllm.config.compilation import CUDAGraphMode
+ from vllm.distributed import get_pp_group
+ from vllm.models.qwen4_exp.amd.model_state import Qwen4ExpModelState
+ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+ 
++from vllm_ascend.models.qwen4_exp.step_metadata import Qwen4ExpStepMetadata
+ from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
+     AscendMambaHybridModelState,
+ )
+@@ -80,6 +82,12 @@
+         finally:
+             config.ple_layer_ids = ple_layer_ids
+ 
++        mc = vllm_config.model_config
++        self.qsa_step_metadata = (
++            Qwen4ExpStepMetadata(model)
++            if mc.dtype == torch.bfloat16 and mc.quantization is None and vllm_config.speculative_config is None
++            else None
++        )
+         self.uses_ngram_embedding = bool(ple_layer_ids) and (get_pp_group().is_first_rank)
+         if not self.uses_ngram_embedding:
+             self.ngram_context_len = 0
+@@ -108,5 +116,23 @@
+             device=self.device,
+         )
+ 
++    def prepare_attn(
++        self, input_batch, cudagraph_mode, block_tables, slot_mappings, attn_groups,
++        kv_cache_config, for_capture=False, ubatch_idx=0, model_specific_attn_metadata=None,
++    ):
++        metadata = super().prepare_attn(
++            input_batch, cudagraph_mode, block_tables, slot_mappings, attn_groups,
++            kv_cache_config, for_capture, ubatch_idx, model_specific_attn_metadata,
++        )
++        if self.qsa_step_metadata is not None:
++            full = for_capture or cudagraph_mode == CUDAGraphMode.FULL
++            phase = "capture" if for_capture else ("full_replay" if full else "eager")
++            self.qsa_step_metadata.prepare(
++                metadata,
++                graph_tokens=input_batch.num_tokens_after_padding if full else None,
++                phase=phase if for_capture or not input_batch.is_dummy else None,
++            )
++        return metadata
++
+ 
+ __all__ = ["AscendQwen4ExpModelState"]
+diff --git a/vllm_ascend/models/qwen4_exp/qsa.py b/vllm_ascend/models/qwen4_exp/qsa.py
+--- a/vllm_ascend/models/qwen4_exp/qsa.py
++++ b/vllm_ascend/models/qwen4_exp/qsa.py
+@@ -357,7 +357,15 @@
+         metadata: QSAForwardMetadata,
+         out: torch.Tensor | None,
+     ) -> torch.Tensor:
+-        logger.info_once("QSA is using native request-batched CANN LightningIndexerV2.")
++        requests = getattr(metadata, "qsa_num_live_requests", metadata.seq_lens.shape[0])
++        rows = getattr(metadata, "qsa_num_live_tokens", metadata.num_actual_tokens)
++        prepared = None
++        if query.shape[0] == rows and getattr(metadata, "qsa_lightning_v2_shape", None) == (requests, rows):
++            prepared = metadata.qsa_lightning_v2_metadata
++        if prepared is not None:
++            logger.info_once("QSA LightningIndexerV2 consumed the MRV2 step schedule.")
++        else:
++            logger.info_once("QSA is using native request-batched CANN LightningIndexerV2.")
+         return qsa_select_paged_tokens_lightning_v2(
+             query,
+             self.compressed_key_cache.kv_cache,
+@@ -370,8 +378,9 @@
+             self.compress_ratio,
+             out,
+             # Host counts are prepared with this batch's QSA metadata.
+-            num_actual_requests=getattr(metadata, "qsa_num_live_requests", None),
+-            num_actual_tokens=getattr(metadata, "qsa_num_live_tokens", metadata.num_actual_tokens),
++            num_actual_requests=requests,
++            num_actual_tokens=rows,
++            prepared_metadata=prepared,
+         )
+ 
+ 
+diff --git a/vllm_ascend/models/qwen4_exp/lightning_indexer.py b/vllm_ascend/models/qwen4_exp/lightning_indexer.py
+--- a/vllm_ascend/models/qwen4_exp/lightning_indexer.py
++++ b/vllm_ascend/models/qwen4_exp/lightning_indexer.py
+@@ -194,6 +194,7 @@
+     *,
+     num_actual_requests: int | None = None,
+     num_actual_tokens: int | None = None,
++    prepared_metadata: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Select QSA groups with native request-batched LightningIndexerV2.
+ 
+@@ -264,14 +265,16 @@
+         cmp_ratio=compress_ratio,
+     )
+     block_topk = token_topk // compress_ratio
+-    metadata = lightning_indexer_v2_metadata(
+-        query.shape[1],
+-        1,
+-        _HEAD_DIM,
+-        block_topk,
+-        batch_size=requests,
+-        **common,
+-    )
++    metadata = prepared_metadata
++    if metadata is None:
++        metadata = lightning_indexer_v2_metadata(
++            query.shape[1],
++            1,
++            _HEAD_DIM,
++            block_topk,
++            batch_size=requests,
++            **common,
++        )
+     # Promote the old BF16-representable uniform weight to FP32. Keep its
+     # effective value while removing zero-head padding supported by native V2.
+     score_weight = math.ldexp(

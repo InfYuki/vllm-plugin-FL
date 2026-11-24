@@ -47,26 +47,32 @@ def _patch_flag_gems_triton_import_compat():
         triton.knobs = knobs
 
 
-# torch.float4_e2m1fn_x2 exists only in CUDA builds of PyTorch 2.7+.
-# vllm.ir.tolerances references it at module level, so we inject a sentinel
-# before any vllm.ir import can happen.
-if "torch" in sys.modules:
-    _torch = sys.modules["torch"]
-    if not hasattr(_torch, "float4_e2m1fn_x2"):
-        _torch.float4_e2m1fn_x2 = _torch.uint8
-else:
-    import torch as _torch
+# Read the startup mode once per interpreter, before any FL compatibility hooks.
+_USE_OFFICIAL_ASCEND = os.environ.get("VLLM_FL_ASCEND_RUNTIME") == "official"
 
-    if not hasattr(_torch, "float4_e2m1fn_x2"):
-        _torch.float4_e2m1fn_x2 = _torch.uint8
-del _torch
+if not _USE_OFFICIAL_ASCEND:
+    # torch.float4_e2m1fn_x2 exists only in CUDA builds of PyTorch 2.7+.
+    # vllm.ir.tolerances references it at module level, so we inject a sentinel
+    # before any vllm.ir import can happen.
+    if "torch" in sys.modules:
+        _torch = sys.modules["torch"]
+        if not hasattr(_torch, "float4_e2m1fn_x2"):
+            _torch.float4_e2m1fn_x2 = _torch.uint8
+    else:
+        import torch as _torch
 
-# Torch's device auto-loader must finish before FlagTree imports Triton;
-# torch_npu's Dynamo setup accesses triton.language during auto-loading.
-_patch_flag_gems_triton_import_compat()
+        if not hasattr(_torch, "float4_e2m1fn_x2"):
+            _torch.float4_e2m1fn_x2 = _torch.uint8
+    del _torch
+
+    # Torch's device auto-loader must finish before FlagTree imports Triton;
+    # torch_npu's Dynamo setup accesses triton.language during auto-loading.
+    _patch_flag_gems_triton_import_compat()
 
 from . import version as version  # PyTorch-style: vllm_fl.version.git_version
-from vllm_fl.utils import get_op_config as _get_op_config
+
+if not _USE_OFFICIAL_ASCEND:
+    from vllm_fl.utils import get_op_config as _get_op_config
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +222,11 @@ def _install_metax_compat():
 
 def register():
     """Register the FL platform."""
+    if _USE_OFFICIAL_ASCEND:
+        from .ascend_runtime import register_platform
+
+        return register_platform()
+
     _init_vendor_device()
 
     # PlatformFL is accelerator-shaped. For the standard FlagGems ARM target,
@@ -301,6 +312,11 @@ def _register_gdn_packed_decode_patch() -> bool:
 
 def register_model():
     """Register FL runtime extensions after vLLM model discovery."""
+    if _USE_OFFICIAL_ASCEND:
+        from .ascend_runtime import register_general_plugins
+
+        register_general_plugins()
+        return
 
     from vllm.platforms import current_platform
 

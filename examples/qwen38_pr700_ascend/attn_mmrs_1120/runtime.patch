@@ -1,0 +1,55 @@
+--- a/vllm_ascend/models/qwen4_exp/model.py
++++ b/vllm_ascend/models/qwen4_exp/model.py
+@@ -61,6 +61,7 @@
+ from vllm.models.qwen4_exp.amd import model as upstream_model  # noqa: E402
+ from vllm.models.qwen4_exp.amd import ple_layer as upstream_ple  # noqa: E402
+ 
++from .attention_mmrs import bind_attention_projection  # noqa: E402
+ from .qsa import AscendQwen4ExpQSAAttention  # noqa: E402
+ 
+ upstream_model.Qwen4ExpQSAAttention = AscendQwen4ExpQSAAttention
+@@ -266,6 +267,16 @@
+         else:
+             raise ValueError(f"Invalid layer_type {layer_type}")
+ 
++        # Both selected owners return the finished local token shard from their terminal projection.
++        self.attention_projects_shard = False
++        if self.use_sequence_parallel:
++            if layer_type == "linear_attention":
++                bind_attention_projection(self.linear_attn.out_proj, "gdn", vllm_config)
++                self.attention_projects_shard = True
++            elif isinstance(self.self_attn, AscendQwen4ExpQSAAttention):
++                bind_attention_projection(self.self_attn.o_proj, "qsa", vllm_config)
++                self.attention_projects_shard = True
++
+         self.mlp = AscendQwen4ExpSparseMoeBlock(vllm_config=vllm_config, prefix=f"{prefix}.mlp")
+ 
+         hc_config = upstream_model.HyperConnectionConfig(
+@@ -338,7 +349,7 @@
+         else:
+             raise ValueError("Invalid layer_type")
+ 
+-        if self.use_sequence_parallel:
++        if self.use_sequence_parallel and not self.attention_projects_shard:
+             attn_out = sp_reduce_scatter(attn_out)
+ 
+         mlp_hc = self.mlp_hyper_connection
+--- a/vllm_ascend/models/qwen4_exp/model_state.py
++++ b/vllm_ascend/models/qwen4_exp/model_state.py
+@@ -26,6 +26,7 @@
+ from vllm.models.qwen4_exp.amd.model_state import Qwen4ExpModelState
+ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+ 
++from vllm_ascend.models.qwen4_exp.attention_mmrs import mark_long_prefill
+ from vllm_ascend.models.qwen4_exp.step_metadata import Qwen4ExpStepMetadata
+ from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
+     AscendMambaHybridModelState,
+@@ -132,7 +133,7 @@
+                 graph_tokens=input_batch.num_tokens_after_padding if full else None,
+                 phase=phase if for_capture or not input_batch.is_dummy else None,
+             )
+-        return metadata
++        return mark_long_prefill(metadata, input_batch, cudagraph_mode, for_capture)
+ 
+ 
+ __all__ = ["AscendQwen4ExpModelState"]
