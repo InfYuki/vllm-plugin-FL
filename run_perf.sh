@@ -10,11 +10,10 @@ case "$n" in
   1024|4096|16384) ;;
   *) echo "$usage" >&2; exit 2 ;;
 esac
-budget=4096
 mask_mib=8192
 case "$mode" in
-  candidate) default_port=19731 ;;
-  baseline)  default_port=19732 ;;
+  candidate) default_port=19743; budget=6144 ;;
+  baseline)  default_port=19744; budget=4096 ;;
   *) echo "$usage" >&2; exit 2 ;;
 esac
 port=${PORT:-$default_port}
@@ -23,7 +22,7 @@ base_url=${base_url%/}
 
 export PYTHONPATH="$PWD:/vllm-workspace/vllm:/workspace/benchmark-deps/.venv/lib/python3.12/site-packages${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
-out="/workspace/results/tp1-skip-hidden-pages-$mode-input-$n-$(date +%Y%m%d-%H%M%S)-$$"
+out="/workspace/results/tp1-prefill6144-$mode-input-$n-$(date +%Y%m%d-%H%M%S)-$$"
 curl -fsS "$base_url/v1/models" | python -c 'import json, sys; sys.exit(0 if any(m["id"] == "Unlimited-OCR" for m in json.load(sys.stdin)["data"]) else "Unlimited-OCR model was not found")'
 mkdir -p "$out"
 snapshot() {
