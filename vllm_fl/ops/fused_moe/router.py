@@ -24,6 +24,7 @@ from vllm_fl.dispatch import CachedOp
 
 logger = init_logger(__name__)
 _ocr_top6_4096_calls = None
+_ocr_wide_top6_calls = None
 _topk_softmax = CachedOp("topk_softmax")
 _grouped_topk = CachedOp("grouped_topk")
 _ocr_extended_top6 = CachedOp("softmax_topk_unbiased")
@@ -151,6 +152,16 @@ def _fl_grouped_topk(
                     )
                     logger.info("FL OCR extended Top-6 dispatched for 4096 rows")
                 _ocr_top6_4096_calls.inc()
+            elif 6010 <= gating_output.shape[0] <= 6144:
+                global _ocr_wide_top6_calls
+                if _ocr_wide_top6_calls is None:
+                    from prometheus_client import Counter
+
+                    _ocr_wide_top6_calls = Counter(
+                        "fl_ocr_wide_top6_calls", "Wide prefill fused OCR Top-6 dispatches"
+                    )
+                    logger.info("FL OCR wide Top-6 dispatched for %d rows", gating_output.shape[0])
+                _ocr_wide_top6_calls.inc()
             return result
         fused = options.get("ocr_prefill_top6") if gating_output.shape[0] == 1024 else None
         if fused is not None:

@@ -256,3 +256,21 @@ def test_rswa_skip_hidden_pages_preserves_read_tokens(reverse, fragmented):
         assert stage_mask[row, ..., compact[row]:].all()
     live.rswa_read_prefixes = []
     assert _stage_rswa_read_view(mask.clone(), table.clone(), live) is lengths
+
+
+def test_wide_rswa_mask_groups_bound_and_order():
+    from unittest.mock import Mock
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.attention import _bounded_rswa_groups
+
+    builder = Mock()
+    queries = torch.tensor([1] * 31 + [6081] + [1] * 32)
+    sequences = torch.tensor([6100] * 31 + [6081] + [6300] * 32)
+    prefixes = torch.full_like(queries, 6000)
+    groups = _bounded_rswa_groups(builder, prefixes, sequences, queries, 32768, 128)
+    assert [(g.token_start, g.token_end) for g in groups] == [(0, 31), (31, 6112), (6112, 6144)]
+    allocated = sum(c.kwargs["query_lens"].numel() * c.kwargs["max_query_len"] * 32768
+                    for c in builder.get_rswa_attn_mask.call_args_list)
+    assert allocated == 6144 * 32768 < 8192 * (1 << 20)
+    prefixes[31] = 6081
+    groups = _bounded_rswa_groups(builder, prefixes, sequences, queries, 32768, 128)
+    assert groups[1].prompt_causal and groups[1].actual_seq_lengths_q == [6081]
