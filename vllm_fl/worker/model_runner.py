@@ -7,6 +7,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -552,6 +553,7 @@ class ModelRunnerFL(
             and isinstance(extra, dict)
             and extra.get("ocr_extended_top6") is True
         )
+        self.ocr_wide_prefill = os.getenv("VLLM_FL_OCR_WIDE_PREFILL") == "1"
         self.ocr_top6_4096 = self.ocr_extended_top6 and extra.get("ocr_top6_4096") is True
         self.graph_runtime = None
         if self.use_ascend_attention:
@@ -4649,7 +4651,8 @@ class ModelRunnerFL(
                 cudagraph_mode == CUDAGraphMode.NONE
                 and max_num_scheduled_tokens > 1
                 and num_tokens_unpadded == num_tokens_padded
-                and (num_tokens_padded == 2048 or (self.ocr_top6_4096 and num_tokens_padded == 4096))
+                and (num_tokens_padded == 2048 or (self.ocr_top6_4096 and num_tokens_padded == 4096)
+                     or (self.ocr_wide_prefill and 6010 <= num_tokens_padded <= 6144))
             )
             if self.ocr_extended_top6 and (uniform_decode or extended_prefill):
                 get_forward_context().additional_kwargs["ocr_extended_top6"] = True
