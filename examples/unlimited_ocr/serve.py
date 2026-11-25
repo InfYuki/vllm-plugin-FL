@@ -56,7 +56,8 @@ def main():
     )
     wide = (
         os.getenv("VLLM_FL_OCR_WIDE_PREFILL") == "1" and args.tp == 1
-        and (seqs, budget, mask, args.block_size) == (64, 6144, 8192, 256)
+        and budget in (6144, 12288)
+        and (seqs, mask, args.block_size) == (64, 8192, 256)
         and os.getenv("VLLM_FL_RSWA_GROUPED_MASK") == "1"
         and os.getenv("VLLM_FL_RSWA_CAUSAL_PREFILL") == "1"
     )

@@ -4652,7 +4652,8 @@ class ModelRunnerFL(
                 and max_num_scheduled_tokens > 1
                 and num_tokens_unpadded == num_tokens_padded
                 and (num_tokens_padded == 2048 or (self.ocr_top6_4096 and num_tokens_padded == 4096)
-                     or (self.ocr_wide_prefill and 6010 <= num_tokens_padded <= 6144))
+                     or (self.ocr_wide_prefill and (6010 <= num_tokens_padded <= 6144
+                                                  or 12020 <= num_tokens_padded <= 12288)))
             )
             if self.ocr_extended_top6 and (uniform_decode or extended_prefill):
                 get_forward_context().additional_kwargs["ocr_extended_top6"] = True

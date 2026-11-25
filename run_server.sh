@@ -7,8 +7,8 @@ usage='Usage: bash run_server.sh [candidate|baseline]'
 if (( $# > 1 )); then echo "$usage" >&2; exit 2; fi
 mask_mib=8192
 case "$mode" in
-  candidate) default_port=19743; budget=6144 ;;
-  baseline)  default_port=19744; budget=4096 ;;
+  candidate) default_port=19747; budget=12288 ;;
+  baseline)  default_port=19748; budget=6144 ;;
   *) echo "$usage" >&2; exit 2 ;;
 esac
 port=${PORT:-$default_port}
@@ -25,8 +25,7 @@ export VLLM_FL_OCR_EXPERT_PREPACK=1
 export VLLM_FL_OCR_EXTENDED_TOP6=1
 export VLLM_FL_OCR_TOP6_4096=1
 export VLLM_FL_OCR_SKIP_HIDDEN_PAGES=1
-export VLLM_FL_OCR_WIDE_PREFILL=0
-if [[ $mode == candidate ]]; then export VLLM_FL_OCR_WIDE_PREFILL=1; fi
+export VLLM_FL_OCR_WIDE_PREFILL=1
 export VLLM_FL_OCR_RSWA_VALID_ROWS=1
 
 python -P - <<'PY'

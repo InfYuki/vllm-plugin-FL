@@ -655,7 +655,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 and (raw_prompt or attn_state == AscendAttentionState.ChunkedPrefill)
                 and rswa_query_lens.device.type == rswa_prefix_lens.device.type == "cpu"
                 and num_reqs_fia > 0 and min(rswa_query_lens.tolist()) > 0
-                and sum(rswa_query_lens.tolist()) == num_actual_tokens <= 6144
+                and sum(rswa_query_lens.tolist()) == num_actual_tokens <= 12288
             ):
                 rswa_groups = _bounded_rswa_groups(
                     self._get_mask_builder(), rswa_prefix_lens, seq_lens[:num_reqs_fia],

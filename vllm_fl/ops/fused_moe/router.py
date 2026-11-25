@@ -152,7 +152,7 @@ def _fl_grouped_topk(
                     )
                     logger.info("FL OCR extended Top-6 dispatched for 4096 rows")
                 _ocr_top6_4096_calls.inc()
-            elif 6010 <= gating_output.shape[0] <= 6144:
+            elif 6010 <= gating_output.shape[0] <= 6144 or 12020 <= gating_output.shape[0] <= 12288:
                 global _ocr_wide_top6_calls
                 if _ocr_wide_top6_calls is None:
                     from prometheus_client import Counter
