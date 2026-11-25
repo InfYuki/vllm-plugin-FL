@@ -135,6 +135,28 @@ class RswaAttentionGroup:
     prompt_causal: bool = False
 
 
+def _bounded_rswa_groups(builder, prefixes, sequences, queries, width, window):
+    """Group consecutive equal Q lengths so dense mask rows sum to scheduled tokens."""
+    groups = []
+    row = token = 0
+    for q, run in groupby(queries.tolist()):
+        count = sum(1 for _ in run)
+        end = row + count
+        stop = token + count * q
+        cumulative = list(range(q, count * q + 1, q))
+        causal = q > 1 and all(
+            q <= length <= prefix <= width
+            for length, prefix in zip(sequences[row:end].tolist(), prefixes[row:end].tolist())
+        )
+        mask = builder.get_splitfuse_attn_mask() if causal else builder.get_rswa_attn_mask(
+            prefix_lens=prefixes[row:end], seq_lens=sequences[row:end],
+            query_lens=queries[row:end], max_kv_len=width, max_query_len=q, rswa_window=window,
+        )
+        groups.append(RswaAttentionGroup(row, end, token, stop, cumulative, mask, causal))
+        row, token = end, stop
+    return tuple(groups)
+
+
 def _build_grouped_rswa_masks(
     builder,
     prefix_lens,
@@ -625,7 +647,21 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             causal_prefill = os.environ.get("VLLM_FL_RSWA_CAUSAL_PREFILL", "1")
             if causal_prefill not in ("0", "1"):
                 raise ValueError("VLLM_FL_RSWA_CAUSAL_PREFILL must be 0 or 1")
+            raw_prompt = attn_state == AscendAttentionState.PrefillNoCache
+            oversized = num_reqs_fia * common_attn_metadata.max_query_len * max_kv_len > (8192 << 20)
             if (
+                os.getenv("VLLM_FL_OCR_WIDE_PREFILL") == "1"
+                and (oversized or (raw_prompt and common_attn_metadata.max_query_len >= 4096))
+                and (raw_prompt or attn_state == AscendAttentionState.ChunkedPrefill)
+                and rswa_query_lens.device.type == rswa_prefix_lens.device.type == "cpu"
+                and num_reqs_fia > 0 and min(rswa_query_lens.tolist()) > 0
+                and sum(rswa_query_lens.tolist()) == num_actual_tokens <= 6144
+            ):
+                rswa_groups = _bounded_rswa_groups(
+                    self._get_mask_builder(), rswa_prefix_lens, seq_lens[:num_reqs_fia],
+                    rswa_query_lens, max_kv_len, rswa_window,
+                )
+            elif (
                 grouped == "1"
                 and attn_state == AscendAttentionState.ChunkedPrefill
                 and self.vllm_config.speculative_config is None
@@ -1311,10 +1347,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             **mask_args,
         )
         if attn_metadata.rswa_groups is not None:
-            if (
-                block_table is None
-                or attn_metadata.attn_state != AscendAttentionState.ChunkedPrefill
-            ):
+            raw_prompt = attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+            if not raw_prompt and (block_table is None or attn_metadata.attn_state != AscendAttentionState.ChunkedPrefill):
                 raise RuntimeError("Grouped R-SWA requires cache-backed ChunkedPrefill")
             for group in attn_metadata.rswa_groups:
                 requests = slice(group.request_start, group.request_end)
@@ -1324,11 +1358,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 if group.prompt_causal:
                     group_args = dict(fia_args, sparse_mode=3)
                     del group_args["pre_tokens"], group_args["next_tokens"]
+                if raw_prompt:
+                    group_args = dict(group_args, key=key[tokens], value=value[tokens])
                 result, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query[tokens],
-                    block_table=block_table[requests].contiguous(),
+                    block_table=None if raw_prompt else block_table[requests].contiguous(),
                     actual_seq_lengths=group.actual_seq_lengths_q,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv[requests],
+                    actual_seq_lengths_kv=group.actual_seq_lengths_q if raw_prompt else actual_seq_lengths_kv[requests],
                     **group_args,
                 )
                 output[tokens] = result.view(-1, self.num_heads, self.head_size)

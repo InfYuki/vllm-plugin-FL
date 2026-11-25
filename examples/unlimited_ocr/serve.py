@@ -54,7 +54,13 @@ def main():
         args.max_num_batched_tokens,
         args.rswa_mask_mib,
     )
-    if not (1 <= seqs <= budget and 1 <= mask <= 8192 and seqs * budget <= mask * 32):
+    wide = (
+        os.getenv("VLLM_FL_OCR_WIDE_PREFILL") == "1" and args.tp == 1
+        and (seqs, budget, mask, args.block_size) == (64, 6144, 8192, 256)
+        and os.getenv("VLLM_FL_RSWA_GROUPED_MASK") == "1"
+        and os.getenv("VLLM_FL_RSWA_CAUSAL_PREFILL") == "1"
+    )
+    if not wide and not (1 <= seqs <= budget and 1 <= mask <= 8192 and seqs * budget <= mask * 32):
         parser.error(
             "R-SWA requires 1 <= sequences <= budget and sequences * budget <= mask MiB * 32"
         )
