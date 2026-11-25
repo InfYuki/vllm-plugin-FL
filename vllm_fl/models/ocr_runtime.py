@@ -187,7 +187,11 @@ def validate_ocr_config(config, *, device_type, vendor):
         if isinstance(extra, dict) and extra.get("ocr_expert_prepack"):
             raise ValueError("ocr_expert_prepack requires VLLM_FL_OCR_EXPERT_PREPACK=1")
     ocr_head_major_kv_enabled(config)
-    if config.scheduler_config.async_scheduling:
+    if config.scheduler_config.async_scheduling and not (
+        os.getenv("VLLM_FL_OCR_ASYNC") == "1" and parallel.tensor_parallel_size == 1
+        and parallel.pipeline_parallel_size == 1 and parallel.data_parallel_size == 1
+        and config.speculative_config is None
+    ):
         raise ValueError("Unlimited-OCR requires synchronous scheduling")
     mode = config.compilation_config.cudagraph_mode
     if mode not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY):
