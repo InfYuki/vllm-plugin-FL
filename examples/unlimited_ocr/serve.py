@@ -99,7 +99,7 @@ def main():
         f"--max-num-batched-tokens={budget}",
         f"--block-size={args.block_size}",
         "--enable-chunked-prefill",
-        "--no-async-scheduling",
+        "--async-scheduling" if os.getenv("VLLM_FL_OCR_ASYNC") == "1" else "--no-async-scheduling",
         f"--gpu-memory-utilization={args.gpu_memory_utilization}",
         "--no-enable-prefix-caching",
         f"--chat-template={CHAT_TEMPLATE}",
