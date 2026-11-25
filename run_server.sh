@@ -7,10 +7,12 @@ usage='Usage: bash run_server.sh [candidate|baseline]'
 if (( $# > 1 )); then echo "$usage" >&2; exit 2; fi
 mask_mib=8192
 case "$mode" in
-  candidate) default_port=19747; budget=12288 ;;
-  baseline)  default_port=19748; budget=6144 ;;
+  candidate) default_port=19749; budget=12288 ;;
+  baseline)  default_port=19750; budget=12288 ;;
   *) echo "$usage" >&2; exit 2 ;;
 esac
+export VLLM_FL_OCR_DIRECT_ROUTE=0
+if [[ $mode == candidate ]]; then export VLLM_FL_OCR_DIRECT_ROUTE=1; fi
 port=${PORT:-$default_port}
 devices=${DEVICES:-0}
 seqs=64

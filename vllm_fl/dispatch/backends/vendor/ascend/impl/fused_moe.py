@@ -5,6 +5,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 import torch_npu
 
 
+_DIRECT_ROUTE = os.getenv('VLLM_FL_OCR_DIRECT_ROUTE') == '1'
 _FRACTAL_NZ = 29
 _OCR_EXPERT_SHAPES = ((64, 1792, 1280), (64, 1280, 896))
 
@@ -156,6 +158,9 @@ def _torch_fused_experts_impl(
         # Native v2 marks remote routes as -1. abs(-1) would read row 1,
         # which is out of bounds when N * topk == 1; use a safe masked row.
         sorted_indices = row_indices.clamp_min(0)
+    elif _DIRECT_ROUTE and w1.shape == _OCR_EXPERT_SHAPES[0] and topk_ids.shape[1] == 6:
+        # All experts are local and all routes active, so indices are a permutation.
+        sorted_indices = row_indices
     else:
         sorted_indices = torch.abs(row_indices)
     result = torch_npu.npu_moe_token_unpermute(
